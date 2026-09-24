@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>GeoJsonEditor</RootNamespace>
+    <AssemblyName>GeoJsonEditor</AssemblyName>
+    <Product>GeoJSON 层级编辑器</Product>
+    <Version>1.1.0</Version>
+    <Copyright>Copyright © 2026</Copyright>
+    <ApplicationIcon Condition="$(RuntimeIdentifier.StartsWith('win'))">assets\app.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 所有 Aprillz.MewUI* 包必须保持同一版本 -->
+    <PackageReference Include="Aprillz.MewUI" Version="0.21.1" />
+    <PackageReference Include="Aprillz.MewUI.Skia.All" Version="0.21.1" />
+    <!--
+      0.21.1 的 Win32 平台程序集加上上游修复提交 ce00cdc（问题 #253：Tooltip 关闭时误释放鼠标捕获，按钮要点两次）。
+      来自 vendor/packages 的本地包，程序集版本仍是 0.21.1.0。生成方法见 scripts/build-mewui-patch.sh。
+    -->
+    <PackageReference Include="Aprillz.MewUI.Platform.Win32" Version="0.21.1.1" />
+    <PackageReference Include="NetTopologySuite" Version="2.6.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- tests/ 是独立的测试项目，不编译进应用 -->
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
+    <None Update="samples\**\*.geojson" CopyToOutputDirectory="PreserveNewest" />
+    <EmbeddedResource Include="assets\app.ico" LogicalName="GeoJsonEditor.app.ico" />
+  </ItemGroup>
+
+</Project>
