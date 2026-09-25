@@ -25,6 +25,14 @@
 3. 从 GitHub 获取新版本并自动更新。
 4. 导入 GeoJSON 时可以选择自动识别上下级关系（属性字段 + 空间包含），先预览（各级数量、已确认 / 待确认 / 冲突），能逐个改待确认的；识别结果只存在程序内部，用户选“导出并保留层级信息”（或保存时选“写入层级信息”）才写进 properties。
 
+第四轮（1.3.0）新增的要求（用户看了 1111 年地图数据的截图后提出）：
+
+1. 缩小时边界粗细不一很难看。
+2. 像 P 社游戏那样按层级显示：缩小时下级自动合并成一个大的上级，放大逐级展开下级；不同层级的显示和选中。
+3. 几个区域共同属于一个更上的层级时，要自动生成这个上级。
+4. 借鉴成熟经验整体优化，打包并推送 GitHub。检测环节用 Sonnet 子代理做，省 token。
+5. （途中追加）更新做成大多数软件那样的“检查更新”按钮，能从 GitHub 查新版本并下载，要看得出它有没有在运行。
+
 ## 硬性约束
 
 - UI 框架：MewUI 0.21.1（NuGet `Aprillz.MewUI` + `Aprillz.MewUI.Skia.All`）。
@@ -32,17 +40,22 @@
 - 地图画布：Skia（`SkiaCanvasView` 的子类 `Map/MapCanvas`）。
 - 几何运算：NetTopologySuite 2.6.0（含 `Coverage` 命名空间）。
 
-## 当前状态（2026-09-25，1.2.0）
+## 当前状态（2026-09-25，1.3.0）
 
 | 内容 | 状态 |
 |---|---|
 | 编译 | 通过，无警告 |
-| 核心逻辑 | `dotnet run --project tests/LogicTests`：原有各项，加上点聚合索引的不变量、自动识别层级（示例数据按属性 / 按空间都还原出原层级；本机有北宋数据时跑一遍，路 24 / 州 330 / 县 1,287）、两种保存方式、更新包的版本解析和文件替换，全部通过 |
-| macOS 运行 | 用后台窗口看过：打开北宋合并数据时的识别对话框和预览、点聚合和单击展开、选中不显示顶点、双击进入顶点编辑 |
-| 没实机验证的 | 真正从 GitHub 下载安装新版本（要等下一个版本发布后才能走完整流程；文件替换逻辑由测试程序覆盖）；Windows 上的一切 |
+| 核心逻辑 | `dotnet run --project tests/LogicTests`：原有各项，加上“层级缩放显示与自动上级”一节（缺少的上级按 parent_name / grandparent_name 新建、按 realm 建最上级、自动边界面积、签名缓存、按缩放折叠展开和单击顺序、同族配色、编组、两种保存方式对新建分组的处理；本机有北宋数据时只用县文件还原出 大宋帝国 → 24 路 → 316 州 → 1,287 县），全部通过 |
+| 画面 | `render` 命令离屏出图检查过 1111 年地图和北宋数据的各级缩放 |
+| macOS 运行 | 1.3.0 由 Sonnet 子代理在后台窗口做过冒烟测试（见下） |
+| 没实机验证的 | 真正从 GitHub 下载安装新版本；Windows 上的一切 |
 | Windows | `scripts/publish.sh win` 在 macOS 上交叉打包，**没在 Windows 真机上验证过** |
 
-测试数据：`/Users/air/Downloads/Geojson/data/processed/1102_song`（北宋，字段是 feature_id / parent_id / name_zh / admin_type，分成 admin、settlements、physical 几个文件；另有 0742_tang）。`dotnet run --project tests/LogicTests -- detect 文件...` 把几个文件当一个文档识别层级并打印结果。
+测试数据：`/Users/air/Downloads/Geojson/data/processed/1102_song`（北宋，字段是 feature_id / parent_id / name_zh / admin_type / realm，分成 admin、settlements、physical 几个文件；另有 0742_tang）。用户截图用的是 `/Users/air/Downloads/中国1111年地图.geojson`（带 parentId：路、道、周边政权是根，下级是点和画成线的州界）。
+
+- `dotnet run --project tests/LogicTests -- detect 文件...`：把几个文件当一个文档识别层级并打印结果。
+- `dotnet run --project tests/LogicTests -- render out.png 文件... [--detect] [--zoom 4.5,6] [--center 经度,纬度] [--tiles] [--nolod]`：用程序自己的 `MapCanvas` 离屏出图（`SetViewForTest` / `RenderForTest`，自动边界同步算完），检查画面比开界面截图省得多。
+- 界面检查交给 Sonnet 子代理（用户要求，省 token）：给它具体步骤，只用 computer-use 的后台工具，报告通过 / 失败即可。
 
 ## 本机环境
 
@@ -74,4 +87,10 @@ export DOTNET_ROOT=$HOME/.dotnet PATH=$HOME/.dotnet:$PATH
 - 顶点编辑状态是 `Editor.VertexEditTarget`，选择变了、换工具、要素被删或隐藏时自动退出。只是选中时不显示手柄。
 - 自动识别层级：`Geo/HierarchyDetector.cs` 只读节点、可在后台线程跑；`HierarchyDetection.Rebuild` 把还没进文档的节点组织成树，`GeoDocument.Restructure` 在文档里整体改上级（一步撤销）。
 - 保存方式：`GeoDocument.WritesHierarchy` 为 false（原文件没有 parentId）时按原有字段写（`GeoJsonIO` 的 hierarchy: false），节点上的 `SourceInfo` 记着原来有哪些字段、名称取自哪个字段。`SourceInfo` 在撤销快照里，删除再撤销不会丢。
-- 自动更新：`App/UpdateService.cs`。替换在程序退出后做（`Program.Main` 在 `Run` 返回后和 `ProcessExit` 里各调一次 `ApplyPending`），仓库名写在 `UpdateService.Repository`。发布时附件名必须是 `GeoJsonEditor-<版本>-win-x64.zip` 和 `GeoJsonEditor-<版本>-macos-arm64.zip`，否则程序找不到安装包；tag 用 `v<版本>`。
+- 按层级缩放显示（`Map/RegionIndex.cs`、`Map/MapCanvas.Regions.cs`）：区域 = 自身是面或下级里有面的可见节点；线、点挂到最近的区域上。文档一改（`_docStamp`）就重建区域树。每帧从根往下走：展开尺度（下级区域的典型边长；只有点、线的区域取自身边长 / 5.5）在屏幕上超过阈值（`ExpandPx`，随“展开细节”变化）就展开，渐变区间内下级的颜色从上级过渡、边界和名称逐渐显现。填充画在一个 `SaveLayer` 半透明图层里（图层内不透明），边界深的先画、浅的压上面。命中测试按显示级排序（`RegionChainAt`）。切割没有选择时只在显示着的那一级里找对象（`CutScope`）。
+- 自动边界：没有自身几何的区域由下级拼出（`DerivedShapes`，后台由深到浅计算，按内容签名缓存）。`GeometryOps.Dissolve` 先用 `CoverageUnion`，结果里下级之间的细缝形成的小圈、尖刺用 `CleanRings` 线性剪掉——**不要**改回“检查 `IsValid` 再修复 / 重算并集”，北宋县数据上会从 1.7 秒变成十几秒。面积对不上（有重叠）才退回 `OverlayNGRobust`。县数据里的河道是真实的缺口，会显示成伸进区域的边界，这是数据本身的样子。
+- 识别层级新建的分组：`HierarchyDetection.CreatedGroups`（`UsedGroups()` 是实际用到的），打开 / 导入时 `Rebuild` 把它们放进树里，文档里重新识别时 `Editor.ApplyHierarchy` 先加进文档再 `Restructure`。“保持原有字段”保存时不写这些没有几何、没有 `SourceInfo` 的分组。
+- 自动配色是“同族同色”：下级区域取上级颜色的深浅变化（`MapStyle.Tint`），区域里的点和线取上级颜色加深。`MapStyle.ColorOf`（图层面板用）和画布的 `FillAutoColors` 缓存必须一致。
+- 标注顺序：先画图钉和簇 → 放区域名称（避开图钉、簇）→ 画小圆点（和区域名称重叠的不画）→ 放地名。区域名称大的按主轴方向逐字拉开（`TrySpreadLabel`，陡的从上往下读）。
+- 点的显示方式 `PointDisplay`：逐级显示（默认，簇的代表点；所属区域折叠时取更粗一级的代表点；藏起来的点多时整屏画成小圆点）、聚合计数（原来的数字圆）、全部。
+- 自动更新：`App/UpdateService.cs`。右上角常驻“检查更新”按钮（用户要求，和一般软件一样，要看得出有没有在运行）：`UpdateService.Status`（正在检查 / 已是最新 / 新版本 / 下载中 / 待重启 / 失败）变化时按钮跟着变，手动检查、启动时的自动检查、下载都会更新它。替换在程序退出后做（`Program.Main` 在 `Run` 返回后和 `ProcessExit` 里各调一次 `ApplyPending`），仓库名写在 `UpdateService.Repository`。发布时附件名必须是 `GeoJsonEditor-<版本>-win-x64.zip` 和 `GeoJsonEditor-<版本>-macos-arm64.zip`，否则程序找不到安装包；tag 用 `v<版本>`。

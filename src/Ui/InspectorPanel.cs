@@ -238,9 +238,10 @@ public sealed class InspectorPanel
     {
         (string Key, string Text)[] tips =
         [
-            ("单击", "选择要素；再次单击同一处选中上一级"),
-            ("双击 / 回车", "编辑所选面或线的顶点"),
-            ("单击数字圆", "放大展开聚合在一起的点"),
+            ("缩放", "缩小时下级合并成上级，放大逐级展开"),
+            ("单击", "选中当前显示的那一级；再次单击同一处选上一级"),
+            ("双击 / 回车", "编辑所选面或线的顶点；双击分组放大到它"),
+            ("⌘/Ctrl+G", "编组：为所选要素新建共同上级"),
             ("Shift/⌘ 单击", "多选，之后按 M 合并"),
             ("X", "切割：画线穿过要素后双击"),
             ("P / L / A", "画点 / 线 / 面"),
@@ -482,7 +483,11 @@ public sealed class InspectorPanel
                 var descendants = node.Descendants().ToList();
                 rows.Add(("下级要素", $"{descendants.Count} 个"));
                 double area = descendants.Where(d => d.Kind == NodeKind.Polygon && d.Children.All(c => c.Kind != NodeKind.Polygon)).Sum(d => GeoMeasure.Area(d.Geometry));
-                if (area > 0) rows.Add(("下级面积合计", GeoMeasure.FormatArea(area)));
+                if (area > 0)
+                {
+                    rows.Add(("下级面积合计", GeoMeasure.FormatArea(area)));
+                    rows.Add(("范围", "由下级自动拼成"));
+                }
                 break;
             }
         }
@@ -640,8 +645,11 @@ public sealed class InspectorPanel
         }
         if (node.Kind is NodeKind.Group or NodeKind.Polygon)
         {
-            list.Add(ActionButton(Icons.Rebuild, "由下级生成边界", () => _editor.RebuildFromChildren(), enabled: _editor.CanRebuildFromChildren(node))
-                .ToolTip("用全部下级面的并集重新生成它的范围")
+            bool group = node.Kind == NodeKind.Group;
+            list.Add(ActionButton(Icons.Rebuild, group ? "把自动范围写入为边界" : "由下级生成边界", () => _editor.RebuildFromChildren(), enabled: _editor.CanRebuildFromChildren(node))
+                .ToolTip(group
+                    ? "分组的范围在地图上由下级自动拼成，只用于显示。写入后成为它自己的几何，保存和导出时一起写出"
+                    : "用全部下级面的并集重新生成它的范围")
                 .StretchHorizontal());
         }
         if (_editor.CanClipToParent(node))

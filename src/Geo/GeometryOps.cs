@@ -6,6 +6,13 @@ using NetTopologySuite.Operation.Union;
 
 namespace GeoJsonEditor.Geo;
 
+/// <summary>自动边界的计算统计（测试程序用）。</summary>
+public static class DissolveStats
+{
+    public static int Coverage;
+    public static int Fallback;
+}
+
 /// <summary>合并、切割、裁剪等几何运算。输入输出都是经纬度几何，不修改输入对象。</summary>
 public static class GeometryOps
 {
@@ -33,6 +40,147 @@ public static class GeometryOps
         if (polys.Count == 1) return Geometries.PolygonalPart(polys[0]);
         var union = UnaryUnionOp.Union(polys);
         return Geometries.PolygonalPart(union);
+    }
+
+    /// <summary>
+    /// 由下级拼出上级的范围（显示用的自动边界，与 P 社游戏里由省份拼出国家的做法相同）。
+    /// 下级正好拼成覆盖面（公共边界的顶点一致）时用覆盖面合并，比一般的并集快得多；
+    /// 否则退回稳健的并集。结果去掉下级之间的细缝留下的狭长空洞（宽度不到范围的万分之一），
+    /// 真正的飞地空洞保留。并集失败时返回不合并的多面，至少范围是完整的。
+    /// </summary>
+    public static Geometry? Dissolve(IReadOnlyList<Geometry> parts)
+    {
+        var polys = parts.SelectMany(Geometries.Polygons).Where(p => !p.IsEmpty && p.Area > 0).ToList();
+        if (polys.Count == 0) return null;
+        if (polys.Count == 1) return polys[0];
+        var f = Geometries.Factory;
+        double sum = polys.Sum(p => p.Area);
+        Geometry? result = null;
+        try
+        {
+            var coverage = NetTopologySuite.Operation.OverlayNG.CoverageUnion.Union(f.BuildGeometry(polys));
+            // 不是合格的覆盖面（有重叠）时结果面积对不上或者无效
+            // 下级之间有细缝（公共边界两侧的顶点不一致）时，结果里会有环自身相接形成的小圈和来回的尖刺，
+            // 在 CleanRings 里直接剪掉，比检查有效性再修复（或者重算一般并集）快一个数量级
+            if (coverage != null && Math.Abs(coverage.Area - sum) <= sum * 1e-7) result = CleanRings(coverage, sum);
+        }
+        catch (Exception)
+        {
+        }
+        if (result != null) Interlocked.Increment(ref DissolveStats.Coverage);
+        else Interlocked.Increment(ref DissolveStats.Fallback);
+        if (result == null)
+        {
+            try
+            {
+                result = NetTopologySuite.Operation.OverlayNG.OverlayNGRobust.Union(f.BuildGeometry(polys.Select(p => Clean(p)).ToArray()));
+            }
+            catch (Exception)
+            {
+                return Geometries.ToPolygonal(polys);
+            }
+        }
+        return RemoveSlivers(Geometries.PolygonalPart(result));
+    }
+
+    /// <summary>
+    /// 剪掉环上自身相接形成的小圈（面积不到总面积的十万分之一，例如细缝留下的倒转小空洞）和来回的尖刺，
+    /// 再去掉因此退化的环和面积极小的碎块。线性时间。
+    /// </summary>
+    private static Geometry? CleanRings(Geometry g, double total)
+    {
+        double minLoop = total * 1e-5, minPart = total * 1e-9;
+        var f = Geometries.Factory;
+        var result = new List<Polygon>();
+        foreach (var p in Geometries.Polygons(g))
+        {
+            var shell = CleanRing(p.Shell.Coordinates, minLoop);
+            if (shell == null) continue;
+            var holes = new List<LinearRing>();
+            foreach (var h in p.Holes)
+            {
+                var hole = CleanRing(h.Coordinates, minLoop);
+                if (hole != null) holes.Add(f.CreateLinearRing(hole));
+            }
+            var poly = f.CreatePolygon(f.CreateLinearRing(shell), holes.ToArray());
+            if (Math.Abs(poly.Area) >= minPart) result.Add(poly);
+        }
+        return Geometries.ToPolygonal(result);
+    }
+
+    private static Coordinate[]? CleanRing(Coordinate[] ring, double minLoop)
+    {
+        int n = ring.Length - 1;
+        if (n < 3) return null;
+        var output = new List<Coordinate>(n + 1);
+        var seen = new Dictionary<(double, double), int>(n);
+        for (int i = 0; i < n; i++)
+        {
+            var c = ring[i];
+            if (output.Count > 0 && output[^1].Equals2D(c)) continue;
+            if (seen.TryGetValue((c.X, c.Y), out int j) && j < output.Count && output[j].Equals2D(c))
+            {
+                // output[j..] 回到了 c：一个小圈（或尖刺），面积小就剪掉
+                double area = 0;
+                for (int k = j, m = output.Count; k < m; k++)
+                {
+                    var a = output[k];
+                    var b = k + 1 < m ? output[k + 1] : c;
+                    area += a.X * b.Y - b.X * a.Y;
+                }
+                if (Math.Abs(area) / 2 < minLoop)
+                {
+                    for (int k = j + 1; k < output.Count; k++) seen.Remove((output[k].X, output[k].Y));
+                    output.RemoveRange(j + 1, output.Count - j - 1);
+                    continue;
+                }
+            }
+            seen[(c.X, c.Y)] = output.Count;
+            output.Add(c);
+        }
+        // 首尾之间也可能是尖刺
+        while (output.Count >= 3 && output[^2].Equals2D(output[0])) output.RemoveAt(output.Count - 1);
+        if (output.Count < 3) return null;
+        output.Add(output[0].Copy());
+        return output.ToArray();
+    }
+
+    /// <summary>
+    /// 去掉下级之间的缝隙留下的空洞：平均宽度（2 × 面积 / 周长）不到范围尺度的千分之三（例如县界之间空出来的河道），
+    /// 或者面积不到总面积的十万分之一。湖泊、飞地这样成片的空洞保留。
+    /// </summary>
+    private static Geometry? RemoveSlivers(Geometry? g)
+    {
+        if (g == null) return null;
+        var polys = Geometries.Polygons(g).ToList();
+        double total = polys.Sum(p => p.Area);
+        if (!(total > 0)) return g;
+        double minWidth = Math.Sqrt(total) * 3e-3, minArea = total * 1e-5;
+        bool changed = false;
+        var result = new List<Polygon>(polys.Count);
+        foreach (var p in polys)
+        {
+            if (p.NumInteriorRings == 0)
+            {
+                result.Add(p);
+                continue;
+            }
+            var keep = new List<LinearRing>();
+            foreach (var hole in p.Holes)
+            {
+                double area = Math.Abs(NetTopologySuite.Algorithm.Area.OfRing(hole.CoordinateSequence));
+                double width = 2 * area / Math.Max(hole.Length, 1e-300);
+                if (area >= minArea && width >= minWidth) keep.Add(hole);
+            }
+            if (keep.Count == p.NumInteriorRings)
+            {
+                result.Add(p);
+                continue;
+            }
+            changed = true;
+            result.Add(Geometries.Factory.CreatePolygon(p.Shell, keep.ToArray()));
+        }
+        return changed ? Geometries.ToPolygonal(result) : g;
     }
 
     /// <summary>把相接的线首尾相连。</summary>

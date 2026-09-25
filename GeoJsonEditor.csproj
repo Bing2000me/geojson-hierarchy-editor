@@ -9,7 +9,7 @@
     <RootNamespace>GeoJsonEditor</RootNamespace>
     <AssemblyName>GeoJsonEditor</AssemblyName>
     <Product>GeoJSON 层级编辑器</Product>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Copyright>Copyright © 2026</Copyright>
     <ApplicationIcon Condition="$(RuntimeIdentifier.StartsWith('win'))">assets\app.ico</ApplicationIcon>
   </PropertyGroup>

@@ -54,7 +54,9 @@ public sealed partial class MapCanvas : SkiaCanvasView
         _editor.BaseMapFade.Changed += InvalidateVisual;
         _editor.BaseMapGray.Changed += InvalidateVisual;
         _editor.ShowLabels.Changed += InvalidateVisual;
-        _editor.ClusterPoints.Changed += InvalidateVisual;
+        _editor.PointDisplay.Changed += InvalidateVisual;
+        _editor.RegionLod.Changed += OnDisplayOptionChanged;
+        _editor.LodDetail.Changed += OnDisplayOptionChanged;
         _editor.VertexEditTarget.Changed += OnVertexEditChanged;
         _editor.Highlights.Changed += InvalidateVisual;
         _editor.ZoomToRequested += nodes => ZoomTo(nodes);
@@ -117,6 +119,12 @@ public sealed partial class MapCanvas : SkiaCanvasView
     public void AdoptShapes(IEnumerable<(GeoNode Node, ProjectedShape Shape)> shapes)
     {
         _shapes.Adopt(shapes);
+    }
+
+    private void OnDisplayOptionChanged()
+    {
+        _styleStamp++;
+        InvalidateVisual();
     }
 
     private void OnSelectionChanged()
@@ -278,8 +286,9 @@ public sealed partial class MapCanvas : SkiaCanvasView
     // ───────────────────────── 命中测试 ─────────────────────────
 
     /// <summary>
-    /// 鼠标下的全部可见要素，按优先级排列：点标记 → 线 → 面（由深到浅，即先下级后上级）。
-    /// 连续单击同一位置时按这个顺序轮换选择，从而可以逐级选到上级区域。
+    /// 鼠标下的全部可见要素，按优先级排列：点标记 → 线 → 区域。区域先是当前显示的那一级
+    /// （缩小时是合并后的上级），然后逐级向上，再从最底层回到显示级的下一级（见 <see cref="RegionChainAt"/>）。
+    /// 连续单击同一位置时按这个顺序轮换选择。
     /// </summary>
     private List<GeoNode> HitTestAll(double sx, double sy)
     {
@@ -288,7 +297,6 @@ public sealed partial class MapCanvas : SkiaCanvasView
         int level = Lod.LevelForZoom(_vp.Zoom);
         var points = new List<(GeoNode Node, double D)>();
         var lines = new List<(GeoNode Node, double D)>();
-        var polys = new List<GeoNode>();
         double tolLine = 6 / s;
 
         // 点只认上一帧画出来的标记：聚合时收进簇里的点看不见，也不该被点中
@@ -300,28 +308,20 @@ public sealed partial class MapCanvas : SkiaCanvasView
             else if (d < points[k].D) points[k] = (n, d);
         }
 
-        // 线和面用当前缩放级别的简化路径判断：误差不到四分之一像素，顶点却少得多
-        foreach (var (n, shape) in Candidates())
+        // 线只认这一帧画出来的（所在区域折叠时不显示，也点不中），用当前缩放级别的简化路径判断
+        foreach (var l in _frame.Lines)
         {
-            switch (shape.Kind)
-            {
-                case NodeKind.Line:
-                {
-                    if (!shape.Intersects(wx - tolLine, wy - tolLine, wx + tolLine, wy + tolLine)) break;
-                    double best = WorldMath.PathsDistanceSq(shape.PathsAt(level), wx, wy);
-                    if (best <= tolLine * tolLine) lines.Add((n, best));
-                    break;
-                }
-                case NodeKind.Polygon:
-                    if (shape.Intersects(wx, wy, wx, wy) && WorldMath.PointInRings(shape.PathsAt(level), wx, wy)) polys.Add(n);
-                    break;
-            }
+            if (l.Alpha < 0.15f || !IsLive(l.Node)) continue;
+            var shape = _shapes.Get(l.Node, _vp);
+            if (shape == null || !shape.Intersects(wx - tolLine, wy - tolLine, wx + tolLine, wy + tolLine)) continue;
+            double best = WorldMath.PathsDistanceSq(shape.PathsAt(level), wx, wy);
+            if (best <= tolLine * tolLine) lines.Add((l.Node, best));
         }
 
         var result = new List<GeoNode>();
         result.AddRange(points.OrderBy(p => p.D).Select(p => p.Node));
         result.AddRange(lines.OrderBy(p => p.D).Select(p => p.Node));
-        result.AddRange(polys.OrderByDescending(p => p.Depth));
+        result.AddRange(RegionChainAt(wx, wy));
         return result;
     }
 

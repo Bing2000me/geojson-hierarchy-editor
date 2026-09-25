@@ -105,7 +105,7 @@ public sealed partial class MainWindow : Window
                 await Task.Delay(3000);
                 if (await UpdateDialog.AutoCheckAsync(_settings) is { } found)
                 {
-                    this.ShowToast($"发现新版本 {found.Version}，点右上角的“新版本”查看更新内容。");
+                    this.ShowToast($"发现新版本 {found.Version}，点右上角的“新版本 {found.Version}”查看更新内容。");
                 }
             };
         }
@@ -120,7 +120,9 @@ public sealed partial class MainWindow : Window
         _editor.BaseMapGray.Value = _settings.BaseMapGray;
         _editor.DataCrs.Value = _settings.DataCrs == "gcj02" ? CoordSystem.Gcj02 : CoordSystem.Wgs84;
         _editor.ShowLabels.Value = _settings.ShowLabels;
-        _editor.ClusterPoints.Value = _settings.ClusterPoints;
+        _editor.PointDisplay.Value = _settings.PointDisplay;
+        _editor.RegionLod.Value = _settings.RegionLod;
+        _editor.LodDetail.Value = Math.Clamp(_settings.LodDetail, 0, 1);
     }
 
     private void SaveSettings()
@@ -130,7 +132,9 @@ public sealed partial class MainWindow : Window
         _settings.BaseMapGray = _editor.BaseMapGray.Value;
         _settings.DataCrs = _editor.DataCrs.Value == CoordSystem.Gcj02 ? "gcj02" : "wgs84";
         _settings.ShowLabels = _editor.ShowLabels.Value;
-        _settings.ClusterPoints = _editor.ClusterPoints.Value;
+        _settings.PointDisplay = _editor.PointDisplay.Value;
+        _settings.RegionLod = _editor.RegionLod.Value;
+        _settings.LodDetail = _editor.LodDetail.Value;
         _settings.Save();
     }
 
@@ -442,7 +446,7 @@ public sealed partial class MainWindow : Window
 
             // 没有层级字段的文件：询问是否自动识别上下级关系（识别结果只进程序内部的层级树）
             IReadOnlyList<GeoNode>? roots = null;
-            int detected = 0;
+            int detected = 0, created = 0;
             if (ShouldAskHierarchy(result))
             {
                 var nodes = result.Roots.SelectMany(r => r.SelfAndDescendants()).ToList();
@@ -450,6 +454,7 @@ public sealed partial class MainWindow : Window
                 if (outcome.Cancelled) return;
                 if (outcome.Detection is { } detection)
                 {
+                    created = detection.UsedGroups().Count;
                     roots = detection.Rebuild(nodes);
                     detected = nodes.Count(n => n.Parent != null);
                 }
@@ -460,7 +465,7 @@ public sealed partial class MainWindow : Window
             _settings.AddRecent(path);
             _map.ZoomToAll();
             string msg = $"已打开 {Path.GetFileName(path)}：{result.FeatureCount:N0} 个要素";
-            if (detected > 0) msg += $"，建立了 {detected:N0} 个上下级关系（只保存在程序里，保存时再决定是否写入文件）";
+            if (detected > 0) msg += $"，建立了 {detected:N0} 个上下级关系" + (created > 0 ? $"，新建了 {created:N0} 个缺少的上级" : "") + "（只保存在程序里，保存时再决定是否写入文件）";
             else if (result.LinkedCount > 0) msg += $"，识别出 {result.LinkedCount:N0} 个上下级关系";
             this.ShowToast(msg + "。" + string.Join("", result.Warnings));
         }

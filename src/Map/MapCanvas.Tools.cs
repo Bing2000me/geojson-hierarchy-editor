@@ -139,7 +139,7 @@ public sealed partial class MapCanvas
                 ? "编辑顶点：拖动白色方块移动顶点，拖动边中间的小圆点插入顶点，右键或双击顶点删除。按回车或 Esc 完成。"
                 : _editor.VertexEditCandidate != null
                     ? "双击要素或按回车编辑顶点；再次单击同一位置选中上一级；Shift 或 ⌘/Ctrl 单击多选。"
-                    : "单击选择要素，再次单击同一位置选中上一级；Shift 或 ⌘/Ctrl 单击多选；拖动空白处平移，滚轮缩放。",
+                    : "单击选中当前显示的那一级，再次单击同一位置选上一级；缩小时下级合并成上级，放大逐级展开；拖动空白处平移，滚轮缩放。",
         };
         HintChanged?.Invoke(hint);
     }
@@ -313,6 +313,14 @@ public sealed partial class MapCanvas
                 if (DoubleClickTarget(p) is { } target)
                 {
                     _editor.BeginVertexEdit(target);
+                }
+                else if (Doc.Selection is [{ Geometry: null } group] && HitTestAll(p.X, p.Y).Contains(group) && ShapeOf(group) is { } shape)
+                {
+                    // 双击分组（范围由下级拼成，没有顶点可编辑）：放大到它，显示它的下级
+                    double zoom = _vp.Zoom;
+                    ZoomTo([group]);
+                    if (_vp.Zoom < zoom + 0.5) _vp.ZoomAround(p.X, p.Y, zoom + 1);
+                    AfterViewChange();
                 }
                 else
                 {
@@ -640,7 +648,7 @@ public sealed partial class MapCanvas
                 int serial = _cutPreviewSerial;
                 if (next.Length < 2) continue;
                 var cutter = Geometries.Factory.CreateLineString(next);
-                var plan = _editor.PlanCut(cutter.EnvelopeInternal);
+                var plan = _editor.PlanCut(cutter.EnvelopeInternal, CutScope());
                 var (data, display) = (_vp.DataCrs, _vp.DisplayCrs);
                 var shapes = await Task.Run(() =>
                 {
@@ -700,7 +708,7 @@ public sealed partial class MapCanvas
                     break;
                 }
                 case EditTool.Cut when pts.Count >= 2:
-                    _editor.Cut(f.CreateLineString(pts.ToArray()));
+                    _editor.Cut(f.CreateLineString(pts.ToArray()), CutScope());
                     break;
             }
         }

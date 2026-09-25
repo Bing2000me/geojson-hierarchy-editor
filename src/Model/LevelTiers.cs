@@ -14,7 +14,7 @@ public static class LevelTiers
     // 按顺序匹配，先匹配到的为准：长词、有歧义的词放前面（“市辖区”先于“市”，“街道”先于“道”）
     private static readonly (string Word, int Tier)[] Keywords =
     [
-        ("首都", 0), ("国都", 0), ("都城", 0), ("京师", 0), ("行在", 0), ("capital", 0), ("country", 0), ("国家", 0),
+        ("首都", 0), ("国都", 0), ("都城", 0), ("京师", 0), ("行在", 0), ("capital", 0), ("country", 0), ("国家", 0), ("政权", 0), ("朝代", 0),
         ("特别行政区", 1), ("自治区", 1), ("直辖市", 1), ("province", 1), ("circuit", 1), ("state", 1), ("省", 1),
         ("地级", 2), ("地区", 2), ("自治州", 2), ("prefecture", 2), ("盟", 2),
         ("市辖区", 3), ("自治县", 3), ("county", 3), ("district", 3), ("县", 3), ("旗", 3),
@@ -24,7 +24,7 @@ public static class LevelTiers
     ];
 
     /// <summary>点要素的类别字段（治所类型、OSM 的 place 等），比级别字段更能说明点的重要程度。</summary>
-    private static readonly string[] PointTypeKeys = ["settlement_type", "place", "fclass", "featurecla"];
+    private static readonly string[] PointTypeKeys = ["settlement_type", "place", "fclass", "featurecla", "marker-symbol"];
 
     /// <summary>数值型的行政级别字段（越小越高），比级别文字更可靠。</summary>
     private static readonly string[] LevelNumberKeys = ["admin_level", "adm_level", "admin_lvl"];

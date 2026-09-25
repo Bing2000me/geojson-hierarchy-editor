@@ -33,7 +33,8 @@ public sealed partial class MainWindow
     private readonly Command _cmdDetectHierarchy = new("edit.detectHierarchy", "识别层级结构…");
     private readonly Command _cmdUndo = new("edit.undo", "撤销");
     private readonly Command _cmdRedo = new("edit.redo", "重做");
-    private readonly Command _cmdNewGroup = new("edit.newGroup", "新建分组");
+    private readonly Command _cmdNewGroup = new("edit.newGroup", "新建空分组");
+    private readonly Command _cmdGroup = new("edit.group", "编组（新建共同上级）");
     private readonly Command _cmdSearch = new("view.search", "搜索图层");
     private readonly Command _cmdMerge = new("edit.merge", "合并所选");
     private readonly Command _cmdRebuild = new("edit.rebuild", "由下级生成边界");
@@ -49,8 +50,6 @@ public sealed partial class MainWindow
     private readonly Command _cmdSimplify = new("edit.simplify", "简化边界…");
     private readonly Command _cmdEditVertices = new("edit.vertices", "编辑顶点");
     private readonly Command _cmdCheckUpdate = new("app.checkUpdate", "检查更新…");
-    private readonly ObservableValue<bool> _updateAvailable = new(false);
-    private readonly ObservableValue<string> _updateText = new("");
 
     // ───────────────────────── 整体布局 ─────────────────────────
 
@@ -144,6 +143,7 @@ public sealed partial class MainWindow
             .Item(_cmdDuplicate)
             .Separator()
             .Item("全选同级", StandardCommands.SelectAll)
+            .Item(_cmdGroup)
             .Item(_cmdNewGroup)
             .Item(_cmdDetectHierarchy)
             .Separator()
@@ -230,12 +230,14 @@ public sealed partial class MainWindow
             .ToolTip("显示 / 隐藏地图标注")
             .BindIsChecked(_editor.ShowLabels);
 
-        var cluster = new ToggleButton()
-            .StyleName(AppStyles.Tool)
-            .Padding(7)
-            .Content(new IconView(Icons.Cluster, 18))
-            .ToolTip("点聚合：点多时缩小地图，相邻的点合成一个带数量的圆，放大后逐级展开")
-            .BindIsChecked(_editor.ClusterPoints);
+        var display = new Button()
+            .StyleName(AppStyles.Ghost)
+            .Content(new StackPanel().Horizontal().Spacing(6).Children(
+                new IconView(Icons.Layers, 16).CenterVertical(),
+                new TextBlock().Text("显示").CenterVertical(),
+                new IconView(Icons.ChevronDown, 14).CenterVertical()))
+            .ToolTip("层级缩放显示、点标记的显示方式");
+        display.Click += () => ShowDisplayPopup(display);
 
         var themeIcon = new IconView(Icons.Moon, 18);
         var themeButton = new Button().StyleName(AppStyles.IconButton).Padding(6).Content(themeIcon).ToolTip("切换深色 / 浅色界面");
@@ -244,10 +246,10 @@ public sealed partial class MainWindow
         Loaded += () => themeIcon.Data = Theme.IsDark ? Icons.Sun : Icons.Moon;
 
         var right = new StackPanel().Horizontal().Spacing(4).CenterVertical().Right().Children(
-            BuildUpdateBadge(),
+            BuildUpdateButton(),
             baseMapButton,
+            display,
             labels,
-            cluster,
             themeButton,
             IconButton(Icons.Keyboard, "快捷键与操作说明", ShowShortcuts));
 
@@ -267,30 +269,84 @@ public sealed partial class MainWindow
             .Child(grid);
     }
 
-    /// <summary>右上角的“新版本”提示：检查到新版本时出现，点开是更新对话框。</summary>
-    private FrameworkElement BuildUpdateBadge()
+    /// <summary>
+    /// 右上角的“检查更新”按钮（和大多数软件一样）：单击打开更新对话框，立刻去 GitHub 检查。
+    /// 按钮本身显示当前状态：正在检查（包括启动时的自动检查）、已是最新、发现新版本、下载进度、等待重启，
+    /// 所以随时看得出更新检查有没有在进行。
+    /// </summary>
+    private FrameworkElement BuildUpdateButton()
     {
-        var badge = new Button()
+        var icon = new IconView(Icons.Update, 15).CenterVertical();
+        var ring = new ProgressRing { IsActive = false }.Width(14).Height(14).CenterVertical();
+        ring.IsVisible = false;
+        var text = new TextBlock().FontSize(12.5).CenterVertical();
+        bool highlight = false;
+        var button = new Button()
             .StyleName(AppStyles.Ghost)
             .Padding(9, 4)
-            .Content(new StackPanel().Horizontal().Spacing(6).Children(
-                new IconView(Icons.Update, 15).CenterVertical().WithTheme((t, i) => i.Tint = t.Palette.Accent),
-                new TextBlock().BindText(_updateText).CenterVertical().WithTheme((t, tb) => tb.Foreground = t.Palette.Accent)))
-            .ToolTip("有新版本，点击查看更新内容并安装")
+            .Content(new StackPanel().Horizontal().Spacing(6).Children(icon, ring, text))
             .OnClick(() => ShowUpdateDialog(UpdateService.Available))
             .CenterVertical();
-        badge.BindIsVisible(_updateAvailable);
+
+        void Paint(Theme t)
+        {
+            var color = highlight ? t.Palette.Accent : UiColors.Subtle(t);
+            text.Foreground = color;
+            icon.Tint = color;
+        }
+        text.WithTheme((t, _) => Paint(t));
 
         void Sync()
         {
-            var available = UpdateService.Available;
-            _updateAvailable.Value = available != null;
-            _updateText.Value = available == null ? "" : $"新版本 {available.Version}";
+            var status = UpdateService.Status;
+            // “已是最新”“检查失败”只显示一会儿，之后回到“检查更新”
+            bool recent = (DateTime.UtcNow - UpdateService.StatusTime).TotalSeconds < 8;
+            bool busy = status is UpdateStatus.Checking or UpdateStatus.Downloading;
+            ring.IsVisible = busy;
+            ring.IsActive = busy;
+            icon.IsVisible = !busy;
+            highlight = status is UpdateStatus.Available or UpdateStatus.Ready;
+            icon.Data = status switch
+            {
+                UpdateStatus.UpToDate when recent => Icons.Check,
+                UpdateStatus.Failed when recent => Icons.Info,
+                _ => Icons.Update,
+            };
+            text.Text = status switch
+            {
+                UpdateStatus.Checking => "正在检查更新…",
+                UpdateStatus.UpToDate when recent => "已是最新版本",
+                UpdateStatus.Available => $"新版本 {UpdateService.Available?.Version}",
+                UpdateStatus.Downloading => $"正在下载 {UpdateService.DownloadFraction * 100:0}%",
+                UpdateStatus.Ready => "重启以完成更新",
+                UpdateStatus.Failed when recent => "检查更新失败",
+                _ => "检查更新",
+            };
+            string last = _settings.LastUpdateCheck > DateTime.MinValue.AddDays(1)
+                ? $"上次检查：{_settings.LastUpdateCheck.ToLocalTime():yyyy-MM-dd HH:mm}"
+                : "还没有检查过";
+            button.ToolTip(status switch
+            {
+                UpdateStatus.Available => $"有新版本 {UpdateService.Available?.Version}（当前 {UpdateService.CurrentVersion}），点击查看更新内容并安装",
+                UpdateStatus.Ready => "新版本已下载好，点击重启完成更新（也可以等退出程序时自动安装）",
+                UpdateStatus.Failed => $"检查更新失败：{UpdateService.StatusDetail}",
+                _ => $"从 GitHub 检查新版本。当前版本 {UpdateService.CurrentVersion}，{last}",
+            });
+            Paint(Theme);
+            if (recent && status is UpdateStatus.UpToDate or UpdateStatus.Failed) RefreshLater();
         }
-        UpdateService.AvailableChanged += Sync;
-        Closed += () => UpdateService.AvailableChanged -= Sync;
+
+        async void RefreshLater()
+        {
+            await Task.Delay(8200);
+            Sync();
+        }
+
+        UpdateService.StatusChanged += Sync;
+        Closed += () => UpdateService.StatusChanged -= Sync;
+        Loaded += Sync;
         Sync();
-        return badge;
+        return button;
     }
 
     private async void ShowUpdateDialog(UpdateInfo? info)
@@ -741,6 +797,61 @@ public sealed partial class MainWindow
         popup.ShowAt(anchor, anchor.Bounds, PopupAnchorSide.Below);
     }
 
+    // ───────────────────────── 显示面板 ─────────────────────────
+
+    private void ShowDisplayPopup(Button anchor)
+    {
+        var popup = new Popup { StaysOpen = false };
+
+        static TextBlock Note(string text) => new TextBlock()
+            .Text(text)
+            .FontSize(11)
+            .TextWrapping(TextWrapping.Wrap)
+            .WithTheme((t, tb) => tb.Foreground = UiColors.Faint(t));
+
+        var lod = new ToggleSwitch().BindIsChecked(_editor.RegionLod).CenterVertical();
+        var detail = new Slider().Minimum(0).Maximum(1).BindValue(_editor.LodDetail).Width(150).CenterVertical();
+        detail.BindIsEnabled(_editor.RegionLod);
+        var detailRow = new DockPanel().Margin(10, 0).Children(
+            new StackPanel().Horizontal().Spacing(6).DockRight().Children(
+                new TextBlock().Text("少").FontSize(11.5).CenterVertical().WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t)),
+                detail,
+                new TextBlock().Text("多").FontSize(11.5).CenterVertical().WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t))),
+            new TextBlock().Text("展开细节").CenterVertical());
+
+        var pointMode = new ObservableValue<int>((int)_editor.PointDisplay.Value);
+        pointMode.Changed += () => _editor.PointDisplay.Value = (PointDisplay)pointMode.Value;
+        var points = new SegmentedControl().Items("逐级显示", "聚合计数", "全部").BindSelectedIndex(pointMode).CenterVertical();
+
+        var content = new StackPanel().Vertical().Spacing(10).Children(
+            new TextBlock().Text("区域").FontSize(12).SemiBold().Margin(10, 2, 0, 0).WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t)),
+            new DockPanel().Margin(10, 0).Children(lod.DockRight(), new TextBlock().Text("按层级缩放显示").CenterVertical()),
+            Note("缩小时下级合并成上级整块显示，放大后逐级展开；单击选中当前显示的那一级。没有边界的分组由下级自动拼出范围。").Margin(10, -4, 10, 0),
+            detailRow,
+            new Border().Height(1).Margin(4, 2).WithTheme((t, b) => b.Background(UiColors.Divider(t))),
+            new TextBlock().Text("点标记").FontSize(12).SemiBold().Margin(10, 2, 0, 0).WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t)),
+            points.Margin(10, 0),
+            Note("逐级显示：点多时每一片只显示最重要的点（都城、州府优先），放大后逐级显示更多。聚合计数：相邻的点合成带数量的圆。").Margin(10, -2, 10, 6));
+
+        popup.Content = new ShadowDecorator()
+            .BlurRadius(20)
+            .OffsetY(6)
+            .CornerRadius(12)
+            .ShadowColor(Color.FromArgb(56, 15, 23, 42))
+            .Child(new Border()
+                .Width(330)
+                .Padding(6, 10)
+                .CornerRadius(12)
+                .BorderThickness(1)
+                .WithTheme((t, b) =>
+                {
+                    b.Background(UiColors.Surface(t));
+                    b.BorderBrush(UiColors.Divider(t));
+                })
+                .Child(content));
+        popup.ShowAt(anchor, anchor.Bounds, PopupAnchorSide.Below);
+    }
+
     // ───────────────────────── 右键菜单 ─────────────────────────
 
     private ContextMenu BuildRowMenu()
@@ -754,6 +865,7 @@ public sealed partial class MainWindow
             .Item("粘贴", StandardCommands.Paste)
             .Item(_cmdDuplicate)
             .Separator()
+            .Item(_cmdGroup)
             .Item(_cmdNewGroup)
             .Item(_cmdRebuild)
             .Item(_cmdClip)
@@ -777,6 +889,7 @@ public sealed partial class MainWindow
             .Separator()
             .Item(_cmdEditVertices)
             .Item(_cmdMerge)
+            .Item(_cmdGroup)
             .Item(_cmdSimplify)
             .Item(_cmdRebuild)
             .Item(_cmdClip)
@@ -814,6 +927,7 @@ public sealed partial class MainWindow
         Commands.Register(_cmdUndo, () => _editor.Doc.Undo(), () => _editor.Doc.CanUndo);
         Commands.Register(_cmdRedo, () => _editor.Doc.Redo(), () => _editor.Doc.CanRedo);
         Commands.Register(_cmdNewGroup, () => _editor.NewGroup(Editor.SuggestDrawTarget(_editor.Doc.Primary)));
+        Commands.Register(_cmdGroup, () => _editor.GroupSelection());
         Commands.Register(_cmdSearch, () => _layers.FocusSearch());
         Commands.Register(_cmdMerge, () => _editor.Merge(), () => _editor.CanMerge());
         Commands.Register(_cmdRebuild, () => _editor.RebuildFromChildren(), () => _editor.Doc.Selection.Any(_editor.CanRebuildFromChildren));
@@ -854,7 +968,7 @@ public sealed partial class MainWindow
         InputMap.Map(_cmdExport, new KeyGesture(Key.E, primary));
         InputMap.Map(_cmdUndo, new KeyGesture(Key.Z, primary));
         InputMap.Map(_cmdRedo, new KeyGesture(Key.Z, primary | ModifierKeys.Shift), new KeyGesture(Key.Y, primary));
-        InputMap.Map(_cmdNewGroup, new KeyGesture(Key.G, primary));
+        InputMap.Map(_cmdGroup, new KeyGesture(Key.G, primary));
         InputMap.Map(_cmdSearch, new KeyGesture(Key.F, primary));
     }
 
@@ -870,6 +984,12 @@ public sealed partial class MainWindow
     {
         (string Group, (string Keys, string Text)[] Items)[] groups =
         [
+            ("层级显示", [
+                ("缩小 / 放大", "缩小时下级合并成上级整块显示，放大后逐级展开（右上角“显示”里可以关闭或调整展开早晚）"),
+                ("单击", "选中当前显示的那一级；再次单击同一处选上一级，到最上层后从最底层开始"),
+                ("双击分组", "放大到这个分组，显示它的下级"),
+                ("⌘/Ctrl+G", "编组：所选要素的共同上级，范围由下级自动拼成"),
+            ]),
             ("工具", [
                 ("V", "选择：单击选中，再次单击同一处选上一级；拖动空白处平移"),
                 ("P", "放置点标记"),
@@ -900,10 +1020,9 @@ public sealed partial class MainWindow
                 ("回车 / Esc", "完成顶点编辑"),
             ]),
             ("点标记", [
-                ("单击数字圆", "点多时相邻的点合成一个圆，单击放大展开"),
-                ("Shift/⌘/Ctrl 单击数字圆", "把这一簇点加入选择"),
-                ("右键数字圆", "选中这一簇点并弹出菜单"),
-                ("右上角聚合按钮", "开关点聚合"),
+                ("逐级显示（默认）", "点多时每一片只显示最重要的点，放大后逐级显示更多；所属区域合并显示时画成小圆点"),
+                ("聚合计数", "相邻的点合成带数量的圆：单击放大展开，Shift/⌘/Ctrl 单击加入选择，右键选中并弹出菜单"),
+                ("右上角“显示”", "切换点标记的显示方式"),
             ]),
             ("剪贴板", [
                 ("⌘/Ctrl+C", "复制所选要素（含下级），可粘贴到另一个窗口、另一个程序实例或其他 GIS 软件"),
@@ -921,7 +1040,7 @@ public sealed partial class MainWindow
                 ("⌘/Ctrl+O，⌘/Ctrl+S", "打开，保存"),
                 ("⌘/Ctrl+Shift+N", "新建窗口（同时编辑几张地图）"),
                 ("⌘/Ctrl+I，⌘/Ctrl+E", "导入到所选节点，导出所选"),
-                ("⌘/Ctrl+G", "新建分组"),
+                ("⌘/Ctrl+G", "编组：为所选要素新建共同的上级（没有选择时新建空分组）"),
             ]),
         ];
 

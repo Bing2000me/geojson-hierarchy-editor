@@ -149,11 +149,14 @@ public static class UpdateDialog
             progressText.Text = "正在连接…";
             progressPanel.IsVisible = true;
             SetButtons(Make("取消", () => download.Cancel()));
+            UpdateService.SetDownloadFraction(0);
+            UpdateService.SetStatus(UpdateStatus.Downloading);
             var reporter = new Progress<(long Done, long Total)>(x =>
             {
                 double total = Math.Max(1, x.Total);
                 progress.Value = Math.Clamp(x.Done / total, 0, 1);
                 progressText.Text = $"已下载 {x.Done / 1024.0 / 1024.0:0.0} / {total / 1024.0 / 1024.0:0.0} MB";
+                UpdateService.SetDownloadFraction(x.Done / total);
             });
             try
             {
@@ -161,21 +164,25 @@ public static class UpdateDialog
                 progressText.Text = "正在解压…";
                 var staged = await Task.Run(() => UpdateService.Extract(zip, latest.Version), token);
                 UpdateService.SetPending(new PendingUpdate(staged, install, latest.Version));
+                UpdateService.SetStatus(UpdateStatus.Ready);
                 ShowReady(latest);
             }
             catch (OperationCanceledException)
             {
+                UpdateService.SetStatus(UpdateStatus.Available);
                 progressPanel.IsVisible = false;
                 ShowResult(latest);
             }
             catch (UpdateException e)
             {
+                UpdateService.SetStatus(UpdateStatus.Available);
                 progressPanel.IsVisible = false;
                 ShowResult(latest);
                 subtitle.Text = e.Message;
             }
             catch (Exception e)
             {
+                UpdateService.SetStatus(UpdateStatus.Available);
                 progressPanel.IsVisible = false;
                 ShowResult(latest);
                 subtitle.Text = "下载或解压失败：" + e.Message;
@@ -234,13 +241,12 @@ public static class UpdateDialog
         {
             try
             {
-                var latest = await UpdateService.CheckAsync();
+                var latest = await UpdateService.CheckWithStatusAsync();
                 if (!latest.IsNewer)
                 {
                     settings.LastUpdateCheck = DateTime.UtcNow;
                     settings.Save();
                 }
-                UpdateService.SetAvailable(latest);
                 ShowResult(latest);
             }
             catch (UpdateException e)
@@ -280,14 +286,15 @@ public static class UpdateDialog
         if (!settings.AutoCheckUpdates || (DateTime.UtcNow - settings.LastUpdateCheck).TotalHours < 20) return null;
         try
         {
-            var latest = await UpdateService.CheckAsync();
+            var latest = await UpdateService.CheckWithStatusAsync(quiet: true);
             if (!latest.IsNewer || string.Equals(latest.Tag, settings.SkippedVersion, StringComparison.OrdinalIgnoreCase))
             {
                 settings.LastUpdateCheck = DateTime.UtcNow;
                 settings.Save();
+                // 跳过的版本不提示（按钮上也不显示“新版本”）
+                if (latest.IsNewer) UpdateService.SetAvailable(null);
                 return null;
             }
-            UpdateService.SetAvailable(latest);
             return latest;
         }
         catch (Exception)

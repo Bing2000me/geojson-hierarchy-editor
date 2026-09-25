@@ -40,6 +40,10 @@ public sealed partial class MapCanvas
     private readonly Dictionary<GeoNode, SKColor> _colors = new(ReferenceEqualityComparer.Instance);
     private readonly LabelGrid _labelGrid = new();
 
+    // 区域名称占的位置（小圆点和它们重叠时不画）；放区域名称期间为 true
+    private readonly LabelGrid _regionLabelGrid = new();
+    private bool _placingRegionLabels;
+
     // 上一帧视野内的要素，命中测试和吸附只在这里面找（文档改动后到下一次绘制之前不用它）
     private List<VisibleItem> _lastVisible = new();
     private long _lastVisibleStamp = -1;
@@ -75,19 +79,21 @@ public sealed partial class MapCanvas
         DrawFade(canvas);
 
         _pathPoolUsed = 0;
-        var visible = CollectVisible();
+        var frame = BuildFrame();
+        _frame = frame;
+        var visible = CollectVisible(frame);
         _lastVisible = visible;
         _lastVisibleStamp = _docStamp;
 
-        if (!DrawFeatureLayerCached(canvas, scale, visible))
-        {
-            DrawPolygons(canvas, visible);
-            DrawLines(canvas, visible);
-        }
+        if (!DrawFeatureLayerCached(canvas, scale, frame)) DrawRegionLayer(canvas, frame);
         DrawSelection(canvas);
         DrawVertexHandles(canvas);
+        // 先画图钉和簇，再放区域名称（避开图钉和簇），然后画小圆点（和区域名称重叠的让位），最后放地名
+        bool labels = _editor.ShowLabels.Value;
         DrawPoints(canvas, visible);
-        if (_editor.ShowLabels.Value) DrawLabels(canvas, visible);
+        if (labels) DrawRegionLabels(canvas, frame);
+        DrawPendingDots(canvas, labels);
+        if (labels) DrawPointLabels(canvas, visible);
         DrawClusterHoverCard(canvas);
         DrawToolOverlay(canvas);
         DrawVertexHint(canvas);
@@ -194,21 +200,35 @@ public sealed partial class MapCanvas
 
     private readonly record struct VisibleItem(GeoNode Node, ProjectedShape Shape, int Depth);
 
-    private List<VisibleItem> CollectVisible()
+    /// <summary>
+    /// 这一帧可以点中、吸附的要素：显示着的区域（有自身几何的）、显示着的线，以及视野内的全部点
+    /// （点的聚合在绘制时再做）。
+    /// </summary>
+    private List<VisibleItem> CollectVisible(DisplayFrame frame)
     {
+        var list = new List<VisibleItem>(frame.Units.Count + frame.Lines.Count + 256);
+        foreach (var u in frame.Units)
+        {
+            if (u.Region.HasOwnShape && u.Shape != null) list.Add(new VisibleItem(u.Region.Node, u.Shape, u.Region.Depth));
+        }
+        foreach (var l in frame.Lines)
+        {
+            if (l.Alpha >= 0.15f) list.Add(new VisibleItem(l.Node, l.Shape, l.Region?.Depth + 1 ?? 0));
+        }
         var (minX, minY, maxX, maxY) = _vp.VisibleWorld();
         double pad = 40 / _vp.WorldSize;
-        var list = new List<VisibleItem>(Math.Min(Doc.Count, 4096));
-        foreach (var root in Doc.Roots) Collect(root, 0, list, minX - pad, minY - pad, maxX + pad, maxY + pad);
+        foreach (var root in Doc.Roots) CollectPoints(root, 0, list, minX - pad, minY - pad, maxX + pad, maxY + pad);
         return list;
     }
 
-    private void Collect(GeoNode node, int depth, List<VisibleItem> list, double minX, double minY, double maxX, double maxY)
+    private void CollectPoints(GeoNode node, int depth, List<VisibleItem> list, double minX, double minY, double maxX, double maxY)
     {
         if (!node.Visible) return;
-        var shape = _shapes.Get(node, _vp);
-        if (shape != null && shape.Intersects(minX, minY, maxX, maxY)) list.Add(new VisibleItem(node, shape, depth));
-        foreach (var c in node.Children) Collect(c, depth + 1, list, minX, minY, maxX, maxY);
+        if (node.Kind == NodeKind.Point && _shapes.Get(node, _vp) is { } shape && shape.Intersects(minX, minY, maxX, maxY))
+        {
+            list.Add(new VisibleItem(node, shape, depth));
+        }
+        foreach (var c in node.Children) CollectPoints(c, depth + 1, list, minX, minY, maxX, maxY);
     }
 
     /// <summary>命中测试和吸附的候选：上一帧视野内的要素；文档刚改过、还没重绘时退回遍历全部。</summary>
@@ -289,90 +309,14 @@ public sealed partial class MapCanvas
         }
     }
 
-    private static bool HasVisiblePolygonChildren(GeoNode n)
-    {
-        foreach (var c in n.Children)
-        {
-            if (c.Visible && c.Kind == NodeKind.Polygon) return true;
-        }
-        return false;
-    }
-
-    private void DrawPolygons(SKCanvas canvas, List<VisibleItem> visible)
-    {
-        int level = Level;
-        var polys = new List<(VisibleItem Item, SKPath Path, bool IsParent, SKColor Color)>();
-        foreach (var v in visible)
-        {
-            if (v.Shape.Kind != NodeKind.Polygon) continue;
-            var path = RentPath();
-            path.FillType = SKPathFillType.EvenOdd;
-            AppendPaths(path, v.Shape.PathsAt(level), true);
-            if (path.IsEmpty) continue;
-            polys.Add((v, path, HasVisiblePolygonChildren(v.Node), ColorOf(v.Node)));
-        }
-        if (polys.Count == 0) return;
-        bool dark = DarkBase;
-
-        // 填充：上级在下，下级在上（稳定排序，同级保持文档顺序）
-        var byDepth = polys.OrderBy(p => p.Item.Depth).ToList();
-        foreach (var (item, path, isParent, color) in byDepth)
-        {
-            _fill.Color = color.WithAlpha(isParent ? (byte)16 : (byte)(dark ? 105 : 74));
-            canvas.DrawPath(path, _fill);
-        }
-
-        // 描边：下级先画，上级的粗边界压在上面，层级关系一目了然
-        var halo = (dark ? SKColors.White : new SKColor(0xFF, 0xFF, 0xFF)).WithAlpha(dark ? (byte)60 : (byte)170);
-        for (int i = byDepth.Count - 1; i >= 0; i--)
-        {
-            var (item, path, isParent, color) = byDepth[i];
-            if (isParent)
-            {
-                float width = item.Depth switch { 0 => 2.6f, 1 => 2.0f, _ => 1.7f };
-                _stroke.Color = halo;
-                _stroke.StrokeWidth = width + 2.4f;
-                canvas.DrawPath(path, _stroke);
-                _stroke.Color = MapStyle.Darken(color, 0.45f).WithAlpha(235);
-                _stroke.StrokeWidth = width;
-                canvas.DrawPath(path, _stroke);
-            }
-            else
-            {
-                _stroke.Color = (dark ? MapStyle.Lighten(color, 0.3f) : MapStyle.Darken(color, 0.25f)).WithAlpha(230);
-                _stroke.StrokeWidth = 1.3f;
-                canvas.DrawPath(path, _stroke);
-            }
-        }
-    }
-
-    private void DrawLines(SKCanvas canvas, List<VisibleItem> visible)
-    {
-        int level = Level;
-        var casing = DarkBase ? new SKColor(0, 0, 0, 120) : new SKColor(255, 255, 255, 220);
-        foreach (var (node, shape, _) in visible)
-        {
-            if (shape.Kind != NodeKind.Line) continue;
-            _path.Reset();
-            AppendPaths(_path, shape.PathsAt(level), false);
-            if (_path.IsEmpty) continue;
-            _stroke.Color = casing;
-            _stroke.StrokeWidth = 5.5f;
-            canvas.DrawPath(_path, _stroke);
-            _stroke.Color = ColorOf(node);
-            _stroke.StrokeWidth = 3f;
-            canvas.DrawPath(_path, _stroke);
-        }
-    }
-
     private void DrawSelection(SKCanvas canvas)
     {
         int level = Level;
 
-        // 悬停
+        // 悬停（缩小时是合并后的上级区域）
         if (_hover != null && !Doc.IsSelected(_hover) && _hover.IsEffectivelyVisible && _hover.Kind != NodeKind.Point && _drag == DragMode.None)
         {
-            var s = _shapes.Get(_hover, _vp);
+            var s = ShapeOf(_hover);
             if (s != null)
             {
                 _path.Reset();
@@ -393,11 +337,13 @@ public sealed partial class MapCanvas
         foreach (var node in Doc.Selection)
         {
             if (!node.IsEffectivelyVisible) continue;
-            // 分组没有几何：高亮它的全部下级
-            IEnumerable<GeoNode> targets = node.Geometry != null ? [node] : node.Descendants().Where(d => d.Geometry != null && d.IsEffectivelyVisible);
+            // 分组：画由下级拼出的边界；还没算好时高亮它的全部下级
+            IEnumerable<GeoNode> targets = node.Geometry != null || ShapeOf(node) != null
+                ? [node]
+                : node.Descendants().Where(d => d.Geometry != null && d.IsEffectivelyVisible);
             foreach (var t in targets)
             {
-                var s = _shapes.Get(t, _vp);
+                var s = ShapeOf(t);
                 if (s == null || s.Kind == NodeKind.Point || !s.Intersects(minX, minY, maxX, maxY)) continue;
                 _path.Reset();
                 _path.FillType = SKPathFillType.EvenOdd;
@@ -538,9 +484,11 @@ public sealed partial class MapCanvas
     /// 选中要素 → 上两级区域 → 点和簇（按层级、人口排序，每个试右、左、上、下四个位置）→ 更深层级的区域 → 线。
     /// 点标记和簇本身也占位，后放的标注不会压住它们。
     /// </summary>
-    private void DrawLabels(SKCanvas canvas, List<VisibleItem> visible)
+    /// <summary>区域名称：选中点的名称先占位，图钉和簇也先占位；然后浅的层级先放，同一层里大的先放。</summary>
+    private void DrawRegionLabels(SKCanvas canvas, DisplayFrame frame)
     {
         _labelGrid.Clear();
+        _regionLabelGrid.Clear();
         bool dark = DarkBase;
         var ink = dark ? new SKColor(0xF8, 0xFA, 0xFC) : MapStyle.LabelInk;
         var halo = dark ? new SKColor(0x0B, 0x10, 0x18, 0xD0) : MapStyle.LabelHalo;
@@ -551,20 +499,10 @@ public sealed partial class MapCanvas
         {
             if (label.Force) PlacePointLabel(canvas, label, ink, halo);
         }
-
-        var polygons = new List<VisibleItem>();
-        foreach (var v in visible)
-        {
-            if (v.Shape.Kind == NodeKind.Polygon && !string.IsNullOrWhiteSpace(v.Node.Name)) polygons.Add(v);
-        }
-        // 同一层级里大的先放
-        polygons.Sort((a, b) => a.Depth != b.Depth ? a.Depth.CompareTo(b.Depth) : b.Shape.LabelRadiusBound.CompareTo(a.Shape.LabelRadiusBound));
-
-        // 点标记和簇先占位：区域名称不压住它们（放不下时在区域内挪一挪位置）
         foreach (var m in _shownMarkers)
         {
             var (x, y) = _vp.WorldToScreen(m.X, m.Y);
-            _labelGrid.Add(MarkerHitRect(m.Node.Icon, x, y));
+            _labelGrid.Add(m.Compact ? DotHitRect(x, y, m.Tier) : MarkerHitRect(m.Node.Icon, x, y));
         }
         foreach (var c in _shownClusters)
         {
@@ -573,12 +511,34 @@ public sealed partial class MapCanvas
             _labelGrid.Add(new SKRect((float)x - r, (float)y - r, (float)x + r, (float)y + r));
         }
 
-        int p = 0;
-        for (; p < polygons.Count && polygons[p].Depth <= 1; p++)
+        var regions = new List<UnitItem>();
+        foreach (var u in frame.Units)
         {
-            pending |= !TryPolygonLabel(canvas, polygons[p], ink, halo, start);
+            if (u.Shape != null && u.LabelAlpha >= 0.05f && !string.IsNullOrWhiteSpace(u.Region.Node.Name)) regions.Add(u);
+        }
+        regions.Sort((a, b) => a.Region.Depth != b.Region.Depth
+            ? a.Region.Depth.CompareTo(b.Region.Depth)
+            : b.Shape!.LabelRadiusBound.CompareTo(a.Shape!.LabelRadiusBound));
+        _placingRegionLabels = true;
+        try
+        {
+            foreach (var u in regions) pending |= !TryRegionLabel(canvas, u, ink, halo, start);
+        }
+        finally
+        {
+            _placingRegionLabels = false;
         }
 
+        // 还有标注位置没算完：下一帧继续
+        if (pending) QueueRedraw();
+    }
+
+    /// <summary>地名（点和簇的名称，按层级、人口排序）和线的名称，放不下的不画。</summary>
+    private void DrawPointLabels(SKCanvas canvas, List<VisibleItem> visible)
+    {
+        bool dark = DarkBase;
+        var ink = dark ? new SKColor(0xF8, 0xFA, 0xFC) : MapStyle.LabelInk;
+        var halo = dark ? new SKColor(0x0B, 0x10, 0x18, 0xD0) : MapStyle.LabelHalo;
         if (_pointLabels.Count > 0)
         {
             var order = new List<PointLabel>(_pointLabels.Count);
@@ -590,11 +550,6 @@ public sealed partial class MapCanvas
             foreach (var label in order) PlacePointLabel(canvas, label, ink, halo);
         }
 
-        for (; p < polygons.Count; p++)
-        {
-            pending |= !TryPolygonLabel(canvas, polygons[p], ink, halo, start);
-        }
-
         double s = _vp.WorldSize;
         foreach (var (node, shape, _) in visible)
         {
@@ -604,37 +559,6 @@ public sealed partial class MapCanvas
             var (x, y) = _vp.WorldToScreen(lx, ly);
             TryDrawLabel(canvas, node.Name, (float)x, (float)y - 8, 12, false, SKTextAlign.Center, MapStyle.Darken(ColorOf(node), 0.35f), halo, Doc.IsSelected(node));
         }
-
-        // 还有标注位置没算完：下一帧继续
-        if (pending) QueueRedraw();
-    }
-
-    /// <summary>面的名称放在最大内切圆的圆心，圆太小、字放不下时不画。返回 false 表示超出本帧的计算时间，留到下一帧。</summary>
-    private bool TryPolygonLabel(SKCanvas canvas, VisibleItem item, SKColor ink, SKColor halo, long start)
-    {
-        var (node, shape, depth) = item;
-        double s = _vp.WorldSize;
-        // 先用包围盒排除肯定放不下的，省掉内切圆计算
-        if (shape.LabelRadiusBound * s < 14) return true;
-        if (!shape.HasLabel && Stopwatch.GetElapsedTime(start).TotalMilliseconds > LabelBudgetMs) return false;
-        var (lx, ly, radius) = shape.Label;
-        double radiusPx = radius * s;
-        if (radiusPx < 14) return true;
-        float size = depth switch { 0 => 15.5f, 1 => 13.5f, _ => 12.5f };
-        bool bold = depth <= 1;
-        float w = Font(size, bold).MeasureText(node.Name);
-        if (w > radiusPx * 2.6) return true;
-        var (x, y) = _vp.WorldToScreen(lx, ly);
-        float baseline = (float)y + size * 0.35f;
-        // 中心被点标记占了时，在内切圆里上下左右挪一挪
-        float dy = (float)Math.Min(radiusPx * 0.55, size * 1.7), dx = (float)Math.Min(radiusPx * 0.5, w * 0.6);
-        Span<(float X, float Y)> offsets = [(0, 0), (0, -dy), (0, dy), (-dx, 0), (dx, 0)];
-        foreach (var (ox, oy) in offsets)
-        {
-            if (TryDrawLabel(canvas, node.Name, (float)x + ox, baseline + oy, size, bold, SKTextAlign.Center, ink, halo, false, w)) return true;
-        }
-        if (Doc.IsSelected(node)) TryDrawLabel(canvas, node.Name, (float)x, baseline, size, bold, SKTextAlign.Center, ink, halo, true, w);
-        return true;
     }
 
     /// <summary>
@@ -712,6 +636,7 @@ public sealed partial class MapCanvas
         if (rect.Right < 0 || rect.Left > _vp.Width || rect.Bottom < 0 || rect.Top > _vp.Height) return false;
         if (!force && _labelGrid.Collides(rect)) return false;
         _labelGrid.Add(rect);
+        if (_placingRegionLabels) _regionLabelGrid.Add(rect);
         _halo.Color = halo;
         _halo.StrokeWidth = 3.2f;
         canvas.DrawText(text, x, baselineY, align, font, _halo);
@@ -821,6 +746,7 @@ public sealed partial class MapCanvas
     private object? _layerContext;
     private long _layerDocStamp = -1;
     private long _layerStyleStamp = -1;
+    private long _layerRegionVersion = -1;
     private float _layerScale;
     private double _layerZoom;
     private double _layerMinX, _layerMinY, _layerMaxX, _layerMaxY;
@@ -829,22 +755,12 @@ public sealed partial class MapCanvas
     private bool _layerRefreshPending;
 
     /// <summary>视野内的面和线多到值得缓存时才用（小文档每帧直接画更简单也更清晰）。</summary>
-    private static bool IsHeavy(List<VisibleItem> visible)
-    {
-        int count = 0;
-        long vertices = 0;
-        foreach (var v in visible)
-        {
-            if (v.Shape.Kind is not (NodeKind.Polygon or NodeKind.Line)) continue;
-            count++;
-            vertices += v.Shape.VertexCount;
-        }
-        return count >= 300 || vertices >= 150_000;
-    }
+    private static bool IsHeavy(DisplayFrame frame)
+        => frame.Units.Count + frame.Lines.Count >= 300 || frame.VertexCount >= 150_000;
 
-    private bool DrawFeatureLayerCached(SKCanvas canvas, float scale, List<VisibleItem> visible)
+    private bool DrawFeatureLayerCached(SKCanvas canvas, float scale, DisplayFrame frame)
     {
-        if (_drag is DragMode.Vertex or DragMode.MovePoint || !IsHeavy(visible))
+        if (_drag is DragMode.Vertex or DragMode.MovePoint || !IsHeavy(frame))
         {
             DropLayerCache();
             return false;
@@ -854,6 +770,7 @@ public sealed partial class MapCanvas
         bool valid = _layerImage != null
                      && ReferenceEquals(_layerContext, context)
                      && _layerDocStamp == _docStamp
+                     && _layerRegionVersion == _regionVersion
                      && _layerStyleStamp == _styleStamp
                      && _layerScale == scale;
         var (vx0, vy0, vx1, vy1) = _vp.VisibleWorld();
@@ -904,9 +821,7 @@ public sealed partial class MapCanvas
         _vp.Height = h;
         try
         {
-            var items = CollectVisible();
-            DrawPolygons(oc, items);
-            DrawLines(oc, items);
+            DrawRegionLayer(oc, BuildFrame());
             (_layerMinX, _layerMinY, _layerMaxX, _layerMaxY) = _vp.VisibleWorld();
         }
         finally
@@ -920,6 +835,7 @@ public sealed partial class MapCanvas
         _layerZoom = _vp.Zoom;
         _layerScale = scale;
         _layerDocStamp = _docStamp;
+        _layerRegionVersion = _regionVersion;
         _layerStyleStamp = _styleStamp;
         return true;
     }

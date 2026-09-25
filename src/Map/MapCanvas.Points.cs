@@ -1,3 +1,4 @@
+using GeoJsonEditor.App;
 using GeoJsonEditor.Model;
 
 using SkiaSharp;
@@ -7,8 +8,11 @@ using Point = Aprillz.MewUI.Point;
 namespace GeoJsonEditor.Map;
 
 /// <summary>
-/// 点标记的绘制：点多时按缩放级别聚合（见 <see cref="PointClusterIndex"/>），簇画成带颜色构成环的圆，
-/// 单独的点画完整图标；选中的点总是单独画在最上层。画出来的标记和簇记下来，供命中测试和标注避让使用。
+/// 点标记的绘制，三种方式（见 <see cref="PointDisplay"/>）：
+/// 逐级显示（默认）——点多时按缩放级别取舍，每一片只显示最重要的点（都城、州府优先），放大后逐级显示更多，
+/// 与常见地图软件显示地名的方式相同；聚合计数——相邻的点合成带数量的圆；全部显示。
+/// 所属区域还折叠着（缩小时）的点画成小圆点（重要的点大一些），区域展开后画完整图标。
+/// 选中的点总是单独画在最上层。画出来的标记和簇记下来，供命中测试和标注避让使用。
 /// </summary>
 public sealed partial class MapCanvas
 {
@@ -25,12 +29,24 @@ public sealed partial class MapCanvas
     private readonly List<ShownCluster> _shownClusters = new();
     private readonly List<PointLabel> _pointLabels = new();
 
+    /// <summary>
+    /// 等区域名称放好之后再画的小圆点：和区域名称重叠的不画（像地图软件那样，次要的点给名称让位），
+    /// 画出来的才能点中、才有名称。
+    /// </summary>
+    private readonly List<PendingDot> _pendingDots = new();
+
+    private readonly record struct PendingDot(GeoNode Node, int PointIndex, double WX, double WY, float X, float Y, SKColor Color, int Tier, bool Hover, float Rank, int Count);
+
     // 鼠标下的簇和它的成员名称（悬停卡片）
     private (int Level, int Index)? _clusterHover;
     private string _clusterHoverNames = "";
     private bool _lastClickWasCluster;
 
-    private readonly record struct ShownMarker(GeoNode Node, int PointIndex, double X, double Y);
+    /// <summary>逐级显示时这一屏的点画成小圆点（藏起来的点多，说明缩得很小）。</summary>
+    private bool _compactPoints;
+
+    /// <param name="Compact">画成了小圆点（所属区域折叠着）。</param>
+    private readonly record struct ShownMarker(GeoNode Node, int PointIndex, double X, double Y, bool Compact = false, int Tier = -1);
 
     private readonly record struct ShownCluster(int Level, int Index, double X, double Y, float Radius, int Count, int Rep);
 
@@ -115,9 +131,11 @@ public sealed partial class MapCanvas
         _shownMarkers.Clear();
         _shownClusters.Clear();
         _pointLabels.Clear();
+        _pendingDots.Clear();
 
+        var mode = _editor.PointDisplay.Value;
         int level = PointClusterIndex.LevelForZoom(_vp.Zoom);
-        var index = _editor.ClusterPoints.Value && level <= PointClusterIndex.MaxLevel ? EnsureClusterIndex() : null;
+        var index = mode != PointDisplay.All && level <= PointClusterIndex.MaxLevel ? EnsureClusterIndex() : null;
         if (index == null || index.Count < 2)
         {
             DrawMarkersPlain(canvas, visible);
@@ -126,16 +144,25 @@ public sealed partial class MapCanvas
 
         float w = (float)_vp.Width, h = (float)_vp.Height;
         var clusters = index.At(level);
+        var coarser = level > 0 ? index.At(level - 1) : null;
         bool dark = DarkBase;
 
-        // 先数一下画多少个，决定要不要阴影
-        int onScreen = 0;
+        // 先数一下画多少个，决定要不要阴影；逐级显示时再看藏起来的点多不多，多的话这一屏都画成小圆点
+        int onScreen = 0, hidden = 0;
         foreach (ref readonly var c in clusters.AsSpan())
         {
             var (x, y) = _vp.WorldToScreen(c.X, c.Y);
-            if (x > -40 && y > -40 && x < w + 40 && y < h + 40) onScreen++;
+            if (x < -40 || y < -40 || x > w + 40 || y > h + 40) continue;
+            onScreen++;
+            hidden += c.Count - 1;
         }
         bool shadow = onScreen <= MarkerShadowLimit;
+        if (mode == PointDisplay.Declutter)
+        {
+            // 带一点滞后，缩放到临界处时不会来回切换
+            double hiddenShare = onScreen == 0 ? 0 : (double)hidden / (hidden + onScreen);
+            _compactPoints = _compactPoints ? hiddenShare > 0.25 : hiddenShare > 0.4;
+        }
 
         for (int k = 0; k < clusters.Length; k++)
         {
@@ -146,16 +173,24 @@ public sealed partial class MapCanvas
             var node = leaf.Node;
             if (!IsLive(node)) continue;
 
-            if (c.Count == 1)
+            if (c.Count == 1 || mode == PointDisplay.Declutter)
             {
+                // 逐级显示：一片点里只画最重要的那个（簇的代表点）；所属区域还合并着（缩小时）的点取舍得更粗一级。
                 // 选中的点最后单独画在最上层
                 if (Doc.IsSelected(node)) continue;
+                if (mode == PointDisplay.Declutter && coarser != null && c.Parent >= 0 && coarser[c.Parent].Rep != c.Rep && !IsPointRegionOpen(node)) continue;
                 bool hover = ReferenceEquals(node, _hover);
+                bool compact = mode == PointDisplay.Declutter ? _compactPoints : !IsPointRegionOpen(node);
+                if (compact)
+                {
+                    _pendingDots.Add(new PendingDot(node, leaf.PointIndex, c.X, c.Y, (float)x, (float)y, leaf.Color, leaf.Tier, hover, leaf.Rank, c.Count));
+                    continue;
+                }
                 DrawMarker(canvas, node.Icon, leaf.Color, (float)x, (float)y, false, hover, shadow || hover);
                 _shownMarkers.Add(new ShownMarker(node, leaf.PointIndex, c.X, c.Y));
                 if (!string.IsNullOrWhiteSpace(node.Name))
                 {
-                    _pointLabels.Add(new PointLabel(node.Name, (float)x, (float)y, node.Icon, 0, leaf.Rank, leaf.Tier, 1, false));
+                    _pointLabels.Add(new PointLabel(node.Name, (float)x, (float)y, node.Icon, 0, leaf.Rank, leaf.Tier, c.Count, false));
                 }
                 continue;
             }
@@ -196,6 +231,12 @@ public sealed partial class MapCanvas
             {
                 var (x, y) = _vp.WorldToScreen(shape.Points[i], shape.Points[i + 1]);
                 if (x < -40 || y < -40 || x > w + 40 || y > h + 40) continue;
+                bool compact = !dots && total > 250;
+                if (compact)
+                {
+                    _pendingDots.Add(new PendingDot(node, i / 2, shape.Points[i], shape.Points[i + 1], (float)x, (float)y, color, tier ?? -1, hover, rank, 1));
+                    continue;
+                }
                 _shownMarkers.Add(new ShownMarker(node, i / 2, shape.Points[i], shape.Points[i + 1]));
                 if (dots && !hover)
                 {
@@ -215,6 +256,24 @@ public sealed partial class MapCanvas
             }
         }
         DrawSelectedMarkers(canvas);
+    }
+
+    /// <summary>画推迟的小圆点：显示标注时，和区域名称重叠的不画。</summary>
+    private void DrawPendingDots(SKCanvas canvas, bool labels)
+    {
+        foreach (var d in _pendingDots)
+        {
+            var rect = DotHitRect(d.X, d.Y, d.Tier);
+            if (labels && !d.Hover && _regionLabelGrid.Collides(rect)) continue;
+            float r = DrawDot(canvas, d.Color, d.X, d.Y, d.Tier, d.Hover);
+            _shownMarkers.Add(new ShownMarker(d.Node, d.PointIndex, d.WX, d.WY, true, d.Tier));
+            if (labels) _labelGrid.Add(rect);
+            if (!string.IsNullOrWhiteSpace(d.Node.Name))
+            {
+                _pointLabels.Add(new PointLabel(d.Node.Name, d.X, d.Y, MarkerIcon.Circle, r, d.Rank, d.Tier, d.Count, false));
+            }
+        }
+        _pendingDots.Clear();
     }
 
     /// <summary>选中的点：不参与聚合，按实时位置（拖动中也是）画在最上层，名称必定显示。</summary>
@@ -248,6 +307,45 @@ public sealed partial class MapCanvas
     }
 
     private static float ClusterRadius(int count) => 12.5f + 4f * MathF.Log10(count);
+
+    /// <summary>小圆点的半径：都城、省级治所大一些。</summary>
+    private static float DotRadius(int tier) => tier switch
+    {
+        0 => 5.4f,
+        1 => 4.8f,
+        2 => 4.2f,
+        _ => 3.4f,
+    };
+
+    private static SKRect DotHitRect(double x, double y, int tier)
+    {
+        float r = DotRadius(tier) + 4;
+        return new SKRect((float)x - r, (float)y - r, (float)x + r, (float)y + r);
+    }
+
+    /// <summary>
+    /// 城市符号式的小圆点：白边彩心，都城和省级治所中间再加一个白点（◉），返回占用的半径。
+    /// 所属区域还折叠着（缩小时）的点用它，图钉只在放大后出现。
+    /// </summary>
+    private float DrawDot(SKCanvas canvas, SKColor color, float x, float y, int tier, bool hover)
+    {
+        float r = DotRadius(tier);
+        if (hover)
+        {
+            _fill.Color = MapStyle.Accent.WithAlpha(60);
+            canvas.DrawCircle(x, y, r + 6, _fill);
+        }
+        _fill.Color = SKColors.White.WithAlpha(DarkBase ? (byte)215 : (byte)245);
+        canvas.DrawCircle(x, y, r + 1.4f, _fill);
+        _fill.Color = color.WithAlpha(255);
+        canvas.DrawCircle(x, y, r, _fill);
+        if (tier is 0 or 1)
+        {
+            _fill.Color = SKColors.White;
+            canvas.DrawCircle(x, y, r * 0.4f, _fill);
+        }
+        return r + 1.4f;
+    }
 
     /// <summary>
     /// 簇：外圈是按成员颜色比例分段的环（颜色构成一目了然），里面是数量。
@@ -343,7 +441,8 @@ public sealed partial class MapCanvas
         foreach (var m in _shownMarkers)
         {
             var (x, y) = _vp.WorldToScreen(m.X, m.Y);
-            if (MarkerHitRect(m.Node.Icon, x, y).Contains((float)sx, (float)sy))
+            var rect = m.Compact ? DotHitRect(x, y, m.Tier) : MarkerHitRect(m.Node.Icon, x, y);
+            if (rect.Contains((float)sx, (float)sy))
             {
                 yield return (m.Node, (x - sx) * (x - sx) + (y - sy) * (y - sy));
             }

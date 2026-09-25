@@ -535,6 +535,8 @@ public static class GeoJsonIO
         {
             foreach (var n in root.SelfAndDescendants())
             {
+                // 保持原有字段时，程序里为层级新建的分组（没有几何、不是从文件读进来的）不写出：层级本来就不写进文件
+                if (!hierarchy && n.Geometry == null && n.Source == null) continue;
                 if (!first) stream.Write(",\n"u8);
                 first = false;
                 buffer.ResetWrittenCount();

@@ -79,6 +79,8 @@ public static class HierarchyDialog
         var byAttributes = new ObservableValue<bool>(settings.DetectByAttributes);
         var bySpace = new ObservableValue<bool>(settings.DetectBySpace);
         var keepExisting = new ObservableValue<bool>(true);
+        var createMissing = new ObservableValue<bool>(settings.DetectCreateMissing);
+        var groupTop = new ObservableValue<bool>(settings.DetectGroupTop);
         var askAgain = new ObservableValue<bool>(settings.AskHierarchyOnOpen);
 
         void ShowOptions()
@@ -105,6 +107,13 @@ public static class HierarchyDialog
                 new WrapPanel().Spacing(16).Children(
                     new CheckBox().Content("属性字段（上级编号、区划代码等）").BindIsChecked(byAttributes),
                     new CheckBox().Content("空间包含关系").BindIsChecked(bySpace)));
+            var attributeOptions = new StackPanel().Vertical().Spacing(6).Margin(26, 0, 0, 0).Children(
+                new CheckBox().Content("数据里缺少的上级自动新建（按上级名称字段命名）").BindIsChecked(createMissing)
+                    .ToolTip("例如只有州的文件，每个州带着所属路的编号和名称：按它们新建各个路，路的范围由下级的州自动拼成"),
+                new CheckBox().Content("按政权、国家字段再建最上一级").BindIsChecked(groupTop)
+                    .ToolTip("例如各路都属于“大宋帝国”：新建“大宋帝国”作为最上级，缩小地图时整块显示"));
+            attributeOptions.BindIsVisible(byAttributes);
+            sub.Add(attributeOptions);
             if (purpose == Purpose.Document)
             {
                 sub.Add(new CheckBox().Content("保留现有的上下级关系，只为最上层的要素找上级").BindIsChecked(keepExisting));
@@ -151,6 +160,8 @@ public static class HierarchyDialog
             {
                 settings.DetectByAttributes = byAttributes.Value;
                 settings.DetectBySpace = bySpace.Value;
+                settings.DetectCreateMissing = createMissing.Value;
+                settings.DetectGroupTop = groupTop.Value;
             }
             settings.Save();
         }
@@ -178,7 +189,8 @@ public static class HierarchyDialog
             running = new CancellationTokenSource();
             var token = running.Token;
             SetButtons(Make("取消", () => running.Cancel()));
-            var options = new DetectOptions(byAttributes.Value, bySpace.Value, purpose != Purpose.Document || keepExisting.Value);
+            var options = new DetectOptions(byAttributes.Value, bySpace.Value, purpose != Purpose.Document || keepExisting.Value,
+                byAttributes.Value && createMissing.Value, byAttributes.Value && groupTop.Value);
             try
             {
                 var detection = await Task.Run(() => HierarchyDetector.Detect(subjects, pool, options, token), token);
@@ -206,7 +218,11 @@ public static class HierarchyDialog
             int pending = detection.Count(LinkStatus.Pending);
             int conflicts = detection.Count(LinkStatus.Conflict);
             string rules = detection.Rules.Count > 0 ? "依据：" + string.Join("、", detection.Rules) + "。" : "";
-            body.Add(Header(Icons.Check, "自动识别完成", rules + "结果先保存在程序里，不会改动原始文件。"));
+            var createdGroups = detection.UsedGroups();
+            string createdNote = createdGroups.Count > 0
+                ? $"数据里缺少的 {createdGroups.Count:N0} 个上级已新建为分组，它们没有自身的边界，地图上由下级自动拼成。"
+                : "";
+            body.Add(Header(Icons.Check, "自动识别完成", rules + createdNote + "结果先保存在程序里，不会改动原始文件。"));
 
             var levels = new StackPanel().Vertical().Spacing(2);
             var edited = new TextBlock().FontSize(12).WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t));
@@ -226,6 +242,7 @@ public static class HierarchyDialog
                 StatRow("待确认", pending, pending > 0 ? UiColors.Warning : null),
                 StatRow("存在冲突", conflicts, conflicts > 0 ? UiColors.Danger : null),
                 StatRow("没有上级", detection.Proposals.Count(p => p.Suggested == null)));
+            if (createdGroups.Count > 0) relations.Add(StatRow("新建的上级分组", createdGroups.Count));
 
             body.Add(new Grid().Columns("*,*").Spacing(12).Children(
                 StatCard("层级", levels).Column(0),

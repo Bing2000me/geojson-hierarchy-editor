@@ -2,6 +2,9 @@
 //   dotnet run --project tests/LogicTests                                    跑全部检查
 //   dotnet run --project tests/LogicTests -- gen big.geojson 8 16 16 150     生成大数据：省数、每省市数、每市区县数、每条边顶点数
 //   dotnet run --project tests/LogicTests -- bench big.geojson               离屏绘制一帧的耗时，对比分级简化前后
+//   dotnet run --project tests/LogicTests -- render out.png a.geojson [b.geojson …] [选项]
+//       用程序自己的地图绘制代码离屏出图。选项：--zoom 4.5,6,7.5（多个时文件名加后缀）--center 经度,纬度
+//       --size 1100x760 --detect（先自动识别层级）--nolod --detail 0.5 --points declutter|cluster|all --tiles（高德底图）--dark
 
 using System.Diagnostics;
 using System.Text;
@@ -26,6 +29,11 @@ if (args.Length >= 2 && args[0] == "bench")
 {
     Bench.Run(args[1]);
     return 0;
+}
+
+if (args.Length >= 3 && args[0] == "render")
+{
+    return Snapshot.Run(args[1..]);
 }
 
 if (args.Length >= 2 && args[0] == "detect")
@@ -469,12 +477,165 @@ Section("自动识别层级");
             .ToList();
         long tRead2 = swH.ElapsedMilliseconds;
         swH.Restart();
-        var song = HierarchyDetector.Detect(songNodes, songNodes, new DetectOptions());
+        var song = HierarchyDetector.Detect(songNodes, songNodes, new DetectOptions(GroupTop: false));
         var songLevels = song.LevelSummary(out int songPts);
         Console.WriteLine($"      北宋数据 {songNodes.Count:N0} 个要素：读取 {tRead2} ms，识别 {swH.ElapsedMilliseconds} ms；"
             + string.Join("  ", songLevels.Select(l => $"{l.Name} {l.Count:N0}")) + $"  点标记 {songPts:N0}；已确认 {song.ConfirmedLinks:N0}，待确认 {song.Count(LinkStatus.Pending)}，冲突 {song.Count(LinkStatus.Conflict)}");
         Check(songLevels.Take(3).Select(l => (l.Name, l.Count)).SequenceEqual([("路级", 24), ("州级", 330), ("县级", 1287)]), "北宋数据：路 → 州 → 县三级");
         Check(song.ConfirmedLinks > 2800 && song.Count(LinkStatus.Conflict) == 0, "北宋数据：绝大多数关系已确认，没有冲突");
+    }
+}
+
+// ───────────────────────── 层级缩放显示与自动上级 ─────────────────────────
+Section("层级缩放显示与自动上级");
+{
+    // 8 个县（1°×1° 的方块）：左边 4 个属于甲州、右边 4 个属于乙州，都属于东路和“测试国”，但州、路都不在数据里
+    var sb = new StringBuilder("""{"type":"FeatureCollection","features":[""");
+    for (int i = 0; i < 8; i++)
+    {
+        int x = i % 4, y = i / 4;
+        string pid = x < 2 ? "P1" : "P2", pname = x < 2 ? "甲州" : "乙州";
+        string sqRing = $"[[{x},{y}],[{x + 1},{y}],[{x + 1},{y + 1}],[{x},{y + 1}],[{x},{y}]]";
+        sb.Append("{\"type\":\"Feature\",\"properties\":{\"feature_id\":\"x" + i + "\",\"name\":\"县" + i + "\",\"admin_type\":\"县\",\"parent_id\":\"" + pid
+            + "\",\"parent_name\":\"" + pname + "\",\"grandparent_id\":\"L1\",\"grandparent_name\":\"东路\",\"realm\":\"测试国\"},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[" + sqRing + "]}},");
+    }
+    sb.Append("""{"type":"Feature","properties":{"name":"治所"},"geometry":{"type":"Point","coordinates":[0.5,0.5]}}]}""");
+    var flatDoc = GeoJsonIO.Read(sb.ToString());
+    var flatNodesAll = flatDoc.Roots.SelectMany(n => n.SelfAndDescendants()).ToList();
+    var detFlat = HierarchyDetector.Detect(flatNodesAll, flatNodesAll, new DetectOptions());
+    var newGroups = detFlat.UsedGroups();
+    var newByName = newGroups.ToDictionary(g => g.Name);
+    Check(newGroups.Count == 4 && newByName.ContainsKey("甲州") && newByName.ContainsKey("乙州") && newByName.ContainsKey("东路") && newByName.ContainsKey("测试国"),
+        $"数据里缺少的州、路按 parent_name / grandparent_name 新建，另按 realm 建最上级（{string.Join("、", newGroups.Select(g => g.Name))}）");
+    Check(newByName["甲州"].Id == "P1" && newByName["甲州"].Level == "州" && newByName["东路"].Id == "L1" && newByName["东路"].Level == "路" && newByName["测试国"].Level == "政权",
+        "新建分组沿用引用的编号，级别取名称的最后一个字");
+    var flatTree = detFlat.Rebuild(flatNodesAll);
+    var realmNode = flatTree.Single();
+    Check(realmNode.Name == "测试国" && realmNode.Children.Single().Name == "东路" && realmNode.Children[0].Children.Count == 2
+          && realmNode.Children[0].Children.All(z => z.Children.Count(c => c.Kind == NodeKind.Polygon) == 4),
+        "重建的树：测试国 → 东路 → 甲州、乙州 → 各 4 个县");
+    var seatNode = flatNodesAll.First(n => n.Kind == NodeKind.Point);
+    Check(seatNode.Parent?.Name == "县0", "没有属性的点按空间位置挂到县下");
+    // 合并过字段的数据：水系也有 realm 字段但值为 null，不应妨碍按 realm 建最上级
+    var baseText = sb.ToString();
+    var mixedText = baseText[..baseText.LastIndexOf("]}", StringComparison.Ordinal)] + ","
+        + string.Join(",", Enumerable.Range(0, 5).Select(k => "{\"type\":\"Feature\",\"properties\":{\"feature_id\":\"w" + k + "\",\"name\":\"湖" + k + "\",\"realm\":null,\"parent_id\":null},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[[" + (10 + k) + ",0],[" + (10.5 + k) + ",0],[" + (10.5 + k) + ",0.5],[" + (10 + k) + ",0],[" + (10 + k) + ",0]]]}}")) + "]}";
+    var mixedAll = GeoJsonIO.Read(mixedText).Roots.SelectMany(n => n.SelfAndDescendants()).ToList();
+    var mixedDet = HierarchyDetector.Detect(mixedAll, mixedAll, new DetectOptions());
+    Check(mixedDet.UsedGroups().Any(g => g.Name == "测试国"), "其他要素的 realm 为 null 时照样按 realm 建最上级");
+    var noCreateDet = HierarchyDetector.Detect(flatNodesAll, flatNodesAll, new DetectOptions(CreateMissing: false, GroupTop: false));
+    Check(noCreateDet.UsedGroups().Count == 0 && noCreateDet.Proposals.Count(pr => pr.Chosen == null) == 8, "关掉“新建缺少的上级”时县都在最上层");
+
+    // 自动边界：离屏绘制一帧（同步算完）
+    var edDerived = new Editor();
+    edDerived.Doc.Load(flatTree, null);
+    var mapL = new MapCanvas(edDerived, new TileCache(Path.Combine(Path.GetTempPath(), "geojson-editor-test-tiles")));
+    edDerived.BaseMap.Value = TileSource.None;
+    mapL.SetViewForTest(900, 700);
+    using (var surf = SkiaSharp.SKSurface.Create(new SkiaSharp.SKImageInfo(900, 700))) mapL.RenderForTest(surf.Canvas, 1);
+    var regionIdx = mapL.RegionsForTest;
+    var realmReg = regionIdx.Find(realmNode)!;
+    double sqArea = regionIdx.All().Where(r => r.HasOwnShape).Sum(r => r.Area);
+    Check(realmReg.Derived != null && Math.Abs(realmReg.Derived.Area - sqArea) < sqArea * 1e-6 && realmReg.Derived.Paths.Length == 1,
+        "分组的范围由下级拼成：面积等于全部县之和，拼成一个没有空洞的面");
+    Check(regionIdx.Find(newByName["甲州"])!.Derived is { } jiaShape && Math.Abs(jiaShape.Area - sqArea / 2) < sqArea * 1e-6, "州的范围由它的 4 个县拼成");
+    long sigRealm = realmReg.Signature;
+    edDerived.Doc.Edit("改名", () => { realmNode.Children[0].Name = "东路 2"; edDerived.Doc.Touch(ChangeKind.Properties); });
+    Check(mapL.RegionsForTest.Find(realmNode)!.Signature == sigRealm && mapL.RegionsForTest.Find(realmNode)!.Derived != null, "只改属性：自动边界的签名不变，不用重算");
+    var countyNode = flatNodesAll.First(n => n.Name == "县5");
+    edDerived.Doc.Edit("隐藏", () => { countyNode.Visible = false; edDerived.Doc.Touch(ChangeKind.Visibility); });
+    Check(mapL.RegionsForTest.Find(realmNode)!.Signature != sigRealm, "隐藏一个县：上级的签名变了，自动边界重算");
+    edDerived.Doc.Undo();
+
+    // 按缩放折叠 / 展开（示例数据：省 → 市 → 区县，全都有自身边界）
+    var edZ = new Editor();
+    edZ.Open(sample);
+    edZ.BaseMap.Value = TileSource.None;
+    var mapZ = new MapCanvas(edZ, new TileCache(Path.Combine(Path.GetTempPath(), "geojson-editor-test-tiles")));
+    mapZ.SetViewForTest(900, 700);
+    double fitZoom = mapZ.Zoom;
+    var pvCenter = mapZ.Viewport.WorldToData(mapZ.Viewport.CenterX, mapZ.Viewport.CenterY);
+    void RenderAt(double z)
+    {
+        mapZ.SetViewForTest(900, 700, z, pvCenter.Lon, pvCenter.Lat);
+        using var surf = SkiaSharp.SKSurface.Create(new SkiaSharp.SKImageInfo(900, 700));
+        mapZ.RenderForTest(surf.Canvas, 1);
+    }
+    RenderAt(fitZoom - 4);
+    var farUnits = mapZ.DisplayedForTest();
+    Check(farUnits.Count == 1 && farUnits[0].Name == "青禾省" && !farUnits[0].Expanded, "缩得很小时只显示合并后的省");
+    var dz1 = edZ.Doc.Find("d1")!;
+    var ipDz1 = dz1.Geometry!.InteriorPoint;
+    var (hxZ, hyZ) = mapZ.DataToScreenForTest(ipDz1.X, ipDz1.Y);
+    var hitsFarZ = mapZ.HitTestForTest(hxZ, hyZ).Select(n => n.Id).ToList();
+    Check(hitsFarZ.Where(id => !id.StartsWith('m')).Take(3).SequenceEqual(["p1", "d1", "c1"]), $"缩小时单击选中省，再单击依次是区县、市（实际 {string.Join(",", hitsFarZ)}）");
+    RenderAt(fitZoom + 1.5);
+    var nearUnits = mapZ.DisplayedForTest();
+    Check(nearUnits.Any(u => u.Name == "云溪北区") && nearUnits.Any(u => u.Name == "云溪市" && u.Expanded) && !nearUnits.Any(u => u.Name == "青禾省" && !u.Expanded), $"放大后展开到区县（{string.Join("、", nearUnits.Select(u => u.Name + (u.Expanded ? "+" : "")))}）");
+    (hxZ, hyZ) = mapZ.DataToScreenForTest(ipDz1.X, ipDz1.Y);
+    var hitsNearZ = mapZ.HitTestForTest(hxZ, hyZ).Select(n => n.Id).ToList();
+    Check(hitsNearZ.Where(id => !id.StartsWith('m')).Take(3).SequenceEqual(["d1", "c1", "p1"]), $"放大后单击先选区县，再单击逐级向上（实际 {string.Join(",", hitsNearZ)}）");
+    edZ.RegionLod.Value = false;
+    RenderAt(fitZoom - 4);
+    Check(mapZ.DisplayedForTest().Count == 16 - 5 - 1 || mapZ.DisplayedForTest().Any(u => u.Name == "云溪北区"), "关闭层级缩放显示时各级同时显示");
+    edZ.RegionLod.Value = true;
+
+    // 同族配色：下级是上级颜色的深浅变化
+    var colP1 = MapStyle.ColorOf(edZ.Doc.Find("p1")!);
+    var colC1 = MapStyle.ColorOf(edZ.Doc.Find("c1")!);
+    var colC2 = MapStyle.ColorOf(edZ.Doc.Find("c2")!);
+    colP1.ToHsl(out float hueP1, out _, out _);
+    colC2.ToHsl(out float hueC2, out _, out _);
+    Check(colC1 == colP1 && colC2 != colC1 && Math.Abs(hueC2 - hueP1) < 12, "下级区域用上级的色调，同级之间深浅不同");
+
+    // 编组
+    var cz3 = edZ.Doc.Find("c3")!;
+    var cz4 = edZ.Doc.Find("c4")!;
+    int atIndex = edZ.Doc.IndexOf(cz3);
+    edZ.Doc.SetSelection([cz3, cz4]);
+    var grpNew = edZ.GroupSelection();
+    Check(grpNew.Parent == edZ.Doc.Find("p1") && grpNew.Children.SequenceEqual([cz3, cz4]) && edZ.Doc.IndexOf(grpNew) == atIndex && grpNew.Geometry == null, "编组：新分组放在原位置，所选要素成为它的下级");
+    edZ.Doc.Undo();
+    Check(cz3.Parent == edZ.Doc.Find("p1") && edZ.Doc.Count == 16, "撤销编组");
+
+    // 保持原有字段保存时不写出程序里新建的分组
+    var edPlain = new Editor();
+    edPlain.Load(flatDoc, null, detFlat.Rebuild(flatNodesAll));
+    string plainText = GeoJsonIO.Write(edPlain.Doc.Roots, hierarchy: false);
+    string withLevelsText = GeoJsonIO.Write(edPlain.Doc.Roots, hierarchy: true);
+    Check(GeoJsonIO.Read(plainText).FeatureCount == 9 && GeoJsonIO.Read(withLevelsText).FeatureCount == 13, "保持原有字段：不写新建的分组；写入层级信息：分组一起写出");
+
+    // 文档里重新识别：新建的分组一起加进文档，可以撤销
+    var edRe = new Editor();
+    edRe.Load(GeoJsonIO.Read(sb.ToString()), null);
+    var reAll = edRe.Doc.AllNodes().ToList();
+    edRe.ApplyHierarchy(HierarchyDetector.Detect(reAll, reAll, new DetectOptions()));
+    Check(edRe.Doc.Roots.Count == 1 && edRe.Doc.Count == 13 && edRe.Doc.Roots[0].Name == "测试国", "识别层级结构：新建的上级加进文档");
+    edRe.Doc.Undo();
+    Check(edRe.Doc.Count == 9 && edRe.Doc.Roots.Count == 9, "撤销后新建的上级一起去掉");
+
+    var songCounties = "/Users/air/Downloads/Geojson/data/processed/1102_song/admin/counties.geojson";
+    if (File.Exists(songCounties))
+    {
+        var swCnt = Stopwatch.StartNew();
+        var crRead = GeoJsonIO.ReadFile(songCounties);
+        var cntAll = crRead.Roots.SelectMany(n => n.SelfAndDescendants()).ToList();
+        var cntDet = HierarchyDetector.Detect(cntAll, cntAll, new DetectOptions());
+        var cntLevels = cntDet.LevelSummary(out _);
+        long tCntDet = swCnt.ElapsedMilliseconds;
+        var edCnt = new Editor();
+        edCnt.BaseMap.Value = TileSource.None;
+        edCnt.Doc.Load(cntDet.Rebuild(cntAll), null);
+        var mapCnt = new MapCanvas(edCnt, new TileCache(Path.Combine(Path.GetTempPath(), "geojson-editor-test-tiles")));
+        swCnt.Restart();
+        mapCnt.SetViewForTest(1000, 700);
+        using (var surf = SkiaSharp.SKSurface.Create(new SkiaSharp.SKImageInfo(1000, 700))) mapCnt.RenderForTest(surf.Canvas, 1);
+        var cntRegions = mapCnt.RegionsForTest;
+        var topRegion = cntRegions.Roots.Single();
+        double cntLeafArea = cntRegions.All().Where(r => r.HasOwnShape).Sum(r => r.Area);
+        Console.WriteLine($"      只有县的北宋数据：识别 {tCntDet} ms（" + string.Join("  ", cntLevels.Select(l => $"{l.Name} {l.Count:N0}")) + $"），拼出全部上级的边界 {swCnt.ElapsedMilliseconds} ms");
+        Check(cntLevels.Count >= 4 && cntLevels[0].Count == 1 && cntLevels[1] == ("路级", 24) && cntLevels[3] == ("县级", 1287), "只有县的北宋数据：新建出 大宋帝国 → 24 路 → 州 → 1,287 县");
+        Check(topRegion.Derived != null && Math.Abs(topRegion.Derived.Area - cntLeafArea) < cntLeafArea * 0.002, "大宋帝国的范围由县拼成，面积与全部县之和相差不到千分之二");
     }
 }
 
@@ -754,3 +915,118 @@ static class Bench
         }
     }
 }
+
+static class Snapshot
+{
+    public static int Run(string[] args)
+    {
+        string output = args[0];
+        var files = new List<string>();
+        var zooms = new List<double?>();
+        double lon = 0, lat = 0;
+        bool hasCenter = false, lod = true, detect = false, tiles = false, dark = false;
+        int w = 1100, h = 760;
+        double detail = 0.5;
+        var points = PointDisplay.Declutter;
+        var hits = new List<(double Lon, double Lat)>();
+        for (int i = 1; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--zoom":
+                    zooms.AddRange(args[++i].Split(',').Select(z => (double?)double.Parse(z, System.Globalization.CultureInfo.InvariantCulture)));
+                    break;
+                case "--center":
+                {
+                    var p = args[++i].Split(',');
+                    lon = double.Parse(p[0], System.Globalization.CultureInfo.InvariantCulture);
+                    lat = double.Parse(p[1], System.Globalization.CultureInfo.InvariantCulture);
+                    hasCenter = true;
+                    break;
+                }
+                case "--size":
+                {
+                    var p = args[++i].Split('x');
+                    w = int.Parse(p[0]);
+                    h = int.Parse(p[1]);
+                    break;
+                }
+                case "--nolod": lod = false; break;
+                case "--detect": detect = true; break;
+                case "--tiles": tiles = true; break;
+                case "--dark": dark = true; break;
+                case "--detail": detail = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                case "--points": points = Enum.Parse<PointDisplay>(args[++i], ignoreCase: true); break;
+                case "--hit":
+                {
+                    var p = args[++i].Split(',');
+                    hits.Add((double.Parse(p[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(p[1], System.Globalization.CultureInfo.InvariantCulture)));
+                    break;
+                }
+                default: files.Add(args[i]); break;
+            }
+        }
+        if (zooms.Count == 0) zooms.Add(null);
+
+        var watch = Stopwatch.StartNew();
+        var ed = new Editor();
+        ed.BaseMap.Value = tiles ? TileSource.Amap : TileSource.None;
+        ed.RegionLod.Value = lod;
+        ed.LodDetail.Value = detail;
+        ed.PointDisplay.Value = points;
+        var roots = new List<GeoNode>();
+        foreach (var file in files) roots.AddRange(GeoJsonIO.ReadFile(file).Roots);
+        IReadOnlyList<GeoNode> finalRoots = roots;
+        if (detect)
+        {
+            var all = roots.SelectMany(x => x.SelfAndDescendants()).ToList();
+            var det = HierarchyDetector.Detect(all, all, new DetectOptions());
+            Console.WriteLine($"识别：{string.Join("、", det.Rules)}；新建上级 {det.UsedGroups().Count} 个");
+            finalRoots = det.Rebuild(all);
+        }
+        ed.Doc.Load(finalRoots, files[0]);
+        Console.WriteLine($"读取 {watch.ElapsedMilliseconds} ms，{ed.Doc.Count:N0} 个节点");
+
+        using var cache = new TileCache(TileCache.DefaultDiskRoot());
+        var map = new MapCanvas(ed, cache) { IsDarkTheme = dark };
+        foreach (var zoom in zooms)
+        {
+            map.SetViewForTest(w, h, zoom, lon, lat);
+            if (zoom != null && !hasCenter) map.SetViewForTest(w, h, null);
+            if (zoom != null && !hasCenter) map.SetViewForTest(w, h, zoom, CenterLon(map, w, h), CenterLat(map, w, h));
+            using var surface = SkiaSharp.SKSurface.Create(new SkiaSharp.SKImageInfo(w * 2, h * 2));
+            watch.Restart();
+            map.RenderForTest(surface.Canvas, 2);
+            var frameWatch = Stopwatch.StartNew();
+            map.RenderForTest(surface.Canvas, 2);
+            Console.WriteLine($"  每帧 {frameWatch.Elapsed.TotalMilliseconds / 4:0.0} ms（离屏 CPU 绘制，2 倍像素）");
+            if (tiles)
+            {
+                Thread.Sleep(3000);
+                map.RenderForTest(surface.Canvas, 2);
+            }
+            string path = zooms.Count == 1 ? output : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output))!, Path.GetFileNameWithoutExtension(output) + $"-z{zoom}" + Path.GetExtension(output));
+            using (var image = surface.Snapshot())
+            using (var data = image.Encode(SkiaSharp.SKEncodedImageFormat.Png, 90))
+            using (var fs = File.Create(path))
+            {
+                data.SaveTo(fs);
+            }
+            if (DissolveStats.Coverage + DissolveStats.Fallback > 0) Console.WriteLine($"自动边界：覆盖面合并 {DissolveStats.Coverage}，一般并集 {DissolveStats.Fallback}");
+            foreach (var (hl, ht) in hits)
+            {
+                var (sx, sy) = map.DataToScreenForTest(hl, ht);
+                Console.WriteLine($"  单击 {hl},{ht}（屏幕 {sx:0},{sy:0}）的轮换顺序：" + string.Join(" → ", map.HitTestForTest(sx, sy).Select(n => n.DisplayName)));
+            }
+            var shown = map.DisplayedForTest();
+            Console.WriteLine($"{Path.GetFileName(path)}：缩放 {map.Zoom:0.##}，{watch.ElapsedMilliseconds} ms（含自动边界），显示 {shown.Count} 个区域（展开 {shown.Count(x => x.Expanded)}）");
+        }
+        return 0;
+    }
+
+    // 显示全部数据时的视野中心（先 SetViewForTest(null) 再取）
+    private static double CenterLon(MapCanvas map, int w, int h) => map.Viewport.WorldToData(map.Viewport.CenterX, map.Viewport.CenterY).Lon;
+
+    private static double CenterLat(MapCanvas map, int w, int h) => map.Viewport.WorldToData(map.Viewport.CenterX, map.Viewport.CenterY).Lat;
+}
+

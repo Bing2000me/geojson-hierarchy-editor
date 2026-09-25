@@ -31,31 +31,57 @@ public static class MapStyle
         return new SKColor(0x3B, 0x82, 0xF6);
     }
 
-    /// <summary>节点的实际颜色：有显式颜色用显式颜色，否则按在同级中的位置和层级深度取调色板。</summary>
+    /// <summary>
+    /// 节点的实际颜色：有显式颜色用显式颜色，否则自动配色。
+    /// 自动配色按“同族同色”：最上层按 id 取调色板；下级区域（面、分组）是上级颜色的深浅变化（与 CK3 里附庸领地的配色相同），
+    /// 所以缩小时合并成上级、放大展开下级，整体色调不变；区域里的点和线用上级颜色加深。
+    /// </summary>
     public static SKColor ColorOf(GeoNode node)
     {
         if (node.Color != null) return Parse(node.Color);
-        return Parse(AutoColorHex(node));
+        var parent = node.Parent;
+        if (parent == null) return Parse(Palette[RootIndex(node)]);
+        int index = 0;
+        bool areal = IsArealKind(node.Kind);
+        foreach (var s in parent.Children)
+        {
+            if (ReferenceEquals(s, node)) break;
+            if (areal ? IsArealKind(s.Kind) : s.Kind == node.Kind) index++;
+        }
+        return ChildColor(ColorOf(parent), parent.Kind, node.Kind, index, node.Depth);
     }
 
     public static string AutoColorHex(GeoNode node)
     {
-        var siblings = node.Parent?.Children;
-        int index = 0;
-        if (siblings != null)
-        {
-            int k = 0;
-            foreach (var s in siblings)
-            {
-                if (ReferenceEquals(s, node)) { index = k; break; }
-                if (s.Kind == node.Kind) k++;
-            }
-        }
-        else
-        {
-            index = RootIndex(node);
-        }
-        return Palette[PaletteIndex(index, node.Depth)];
+        var c = ColorOf(node);
+        return $"#{c.Red:X2}{c.Green:X2}{c.Blue:X2}";
+    }
+
+    private static bool IsArealKind(NodeKind kind) => kind is NodeKind.Polygon or NodeKind.Group;
+
+    /// <summary>下级的自动配色：<paramref name="index"/> 是它在同级同类里的序号。</summary>
+    private static SKColor ChildColor(SKColor parent, NodeKind parentKind, NodeKind kind, int index, int depth)
+    {
+        if (!IsArealKind(parentKind)) return Parse(Palette[PaletteIndex(index, depth)]);
+        return IsArealKind(kind) ? Tint(parent, index, depth) : Darken(parent, 0.3f);
+    }
+
+    /// <summary>
+    /// 同一上级下第 <paramref name="index"/> 个下级区域的颜色：在上级颜色上按 0、+1、−1、+2、−2、+3、−3 的顺序
+    /// 改变明度（并略微偏转色相），相邻序号一深一浅，整体仍是上级的色调。
+    /// </summary>
+    public static SKColor Tint(SKColor parent, int index, int depth)
+    {
+        int k = index % 7;
+        int step = (k + 1) / 2 * (k % 2 == 1 ? 1 : -1);
+        if (step == 0) return parent;
+        parent.ToHsl(out float h, out float s, out float l);
+        // 变浅的幅度大、变深的幅度小（深色半透明地铺在底图上会发灰发脏）；越往下级变化越小
+        float dl = depth <= 1 ? 7f : 4.5f;
+        float nl = l + (step > 0 ? step * dl : step * dl * 0.7f);
+        nl = Math.Clamp(nl, 34, 84);
+        float nh = (h + step * 2.5f + 360) % 360;
+        return SKColor.FromHsl(nh, s, nl).WithAlpha(parent.Alpha);
     }
 
     /// <summary>自动配色在调色板里的位置：同级同类中的序号，再按层级深度错开。</summary>
@@ -65,18 +91,29 @@ public static class MapStyle
     public static int RootIndex(GeoNode node) => Math.Abs(StableHash(node.Id) % Palette.Length);
 
     /// <summary>
-    /// 一次算出某个上级（null 为根级）全部下级的自动配色，写入 <paramref name="cache"/>。
+    /// 一次算出某个上级（null 为根级）全部下级的颜色，写入 <paramref name="cache"/>（上级的颜色要先在缓存里）。
     /// 地图每帧都要取色，逐个节点去数同级序号在下级很多时是平方复杂度。
     /// </summary>
     public static void FillAutoColors(GeoNode? parent, IReadOnlyList<GeoNode> siblings, Dictionary<GeoNode, SKColor> cache)
     {
         if (siblings.Count == 0) return;
-        int depth = parent == null ? 0 : parent.Depth + 1;
+        if (parent == null)
+        {
+            foreach (var s in siblings) cache[s] = s.Color != null ? Parse(s.Color) : Parse(Palette[RootIndex(s)]);
+            return;
+        }
+        if (!cache.TryGetValue(parent, out var parentColor))
+        {
+            parentColor = ColorOf(parent);
+            cache[parent] = parentColor;
+        }
+        int depth = parent.Depth + 1;
         Span<int> counters = stackalloc int[4];
         foreach (var s in siblings)
         {
-            int index = parent == null ? RootIndex(s) : counters[(int)s.Kind]++;
-            cache[s] = Parse(Palette[PaletteIndex(index, depth)]);
+            int slot = IsArealKind(s.Kind) ? (int)NodeKind.Group : (int)s.Kind;
+            int index = counters[slot]++;
+            cache[s] = s.Color != null ? Parse(s.Color) : ChildColor(parentColor, parent.Kind, s.Kind, index, depth);
         }
     }
 

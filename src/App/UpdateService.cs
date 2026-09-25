@@ -33,6 +33,22 @@ public sealed record PendingUpdate(string StagedPath, InstallTarget Target, Vers
 /// </list>
 /// 替换在程序退出后进行（<see cref="ApplyPending"/>），这时所有窗口都已关闭、文档都已处理。
 /// </summary>
+/// <summary>更新的整体状态。</summary>
+public enum UpdateStatus
+{
+    /// <summary>还没检查，或者检查结果已经过时不显示了。</summary>
+    Idle,
+    Checking,
+    /// <summary>刚检查过，已是最新版本。</summary>
+    UpToDate,
+    /// <summary>有新版本（<see cref="UpdateService.Available"/>）。</summary>
+    Available,
+    Downloading,
+    /// <summary>新版本已下载解压好，重启或退出时安装。</summary>
+    Ready,
+    Failed,
+}
+
 public static class UpdateService
 {
     public const string Repository = "Bing2000me/geojson-hierarchy-editor";
@@ -94,6 +110,59 @@ public static class UpdateService
     {
         Available = info is { IsNewer: true } ? info : null;
         AvailableChanged?.Invoke();
+        if (Available != null) SetStatus(Pending is { } p && p.Version == Available.Version ? UpdateStatus.Ready : UpdateStatus.Available);
+        else SetStatus(info == null ? UpdateStatus.Idle : UpdateStatus.UpToDate);
+    }
+
+    // ───────────────────────── 状态（右上角的“检查更新”按钮按它显示） ─────────────────────────
+
+    public static UpdateStatus Status { get; private set; } = UpdateStatus.Idle;
+
+    /// <summary>检查失败的原因（<see cref="UpdateStatus.Failed"/> 时）。</summary>
+    public static string StatusDetail { get; private set; } = "";
+
+    /// <summary>状态最近一次改变的时间：“已是最新版本”“检查失败”只在按钮上显示一会儿。</summary>
+    public static DateTime StatusTime { get; private set; } = DateTime.MinValue;
+
+    /// <summary>下载进度（0 到 1）。</summary>
+    public static double DownloadFraction { get; private set; }
+
+    public static event Action? StatusChanged;
+
+    public static void SetStatus(UpdateStatus status, string detail = "")
+    {
+        Status = status;
+        StatusDetail = detail;
+        StatusTime = DateTime.UtcNow;
+        StatusChanged?.Invoke();
+    }
+
+    public static void SetDownloadFraction(double fraction)
+    {
+        DownloadFraction = Math.Clamp(fraction, 0, 1);
+        StatusChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// 检查更新并更新状态（按钮上显示“正在检查”、结果或失败原因）。<paramref name="quiet"/> 为 true（启动时的自动检查）
+    /// 时失败不显示在按钮上。
+    /// </summary>
+    public static async Task<UpdateInfo> CheckWithStatusAsync(bool quiet = false, CancellationToken token = default)
+    {
+        var before = Status;
+        SetStatus(UpdateStatus.Checking);
+        try
+        {
+            var latest = await CheckAsync(token);
+            SetAvailable(latest);
+            return latest;
+        }
+        catch (Exception e)
+        {
+            if (quiet) SetStatus(before is UpdateStatus.Checking ? UpdateStatus.Idle : before);
+            else SetStatus(UpdateStatus.Failed, e is UpdateException ? e.Message : "检查更新时出错：" + e.Message);
+            throw;
+        }
     }
 
     // ───────────────────────── 检查 ─────────────────────────

@@ -20,6 +20,17 @@ public enum EditTool
     Cut,
 }
 
+/// <summary>点标记的显示方式。</summary>
+public enum PointDisplay
+{
+    /// <summary>逐级显示：点多时每一片只显示最重要的点，放大后逐级显示更多（常见地图软件显示地名的方式）。</summary>
+    Declutter,
+    /// <summary>聚合计数：相邻的点合成一个带数量的圆，放大逐级展开。</summary>
+    Cluster,
+    /// <summary>全部显示。</summary>
+    All,
+}
+
 public enum CutMode
 {
     /// <summary>切开的块替换原区域，原来的下级按位置分到各块。</summary>
@@ -43,8 +54,17 @@ public sealed class Editor
     public ObservableValue<bool> BaseMapGray { get; } = new(false);
     public ObservableValue<bool> ShowLabels { get; } = new(true);
 
-    /// <summary>点多时按缩放级别聚合显示（缩小时相邻的点合成一个带数量的圆，放大逐级展开）。</summary>
-    public ObservableValue<bool> ClusterPoints { get; } = new(true);
+    /// <summary>点标记的显示方式（逐级显示 / 聚合计数 / 全部显示）。</summary>
+    public ObservableValue<PointDisplay> PointDisplay { get; } = new(App.PointDisplay.Declutter);
+
+    /// <summary>
+    /// 按层级缩放显示：缩小时下级合并成上级整块显示，放大后逐级展开（参照 P 社游戏的地图）。
+    /// 关闭时所有层级同时显示。
+    /// </summary>
+    public ObservableValue<bool> RegionLod { get; } = new(true);
+
+    /// <summary>层级展开的早晚（0 到 1）：越大越早展开下级，同一缩放下显示的细节越多。</summary>
+    public ObservableValue<double> LodDetail { get; } = new(0.5);
     public ObservableValue<bool> Snapping { get; } = new(true);
     public ObservableValue<bool> LinkedEditing { get; } = new(true);
     public ObservableValue<bool> ClipToParent { get; } = new(true);
@@ -214,18 +234,34 @@ public sealed class Editor
         Doc.SetSelection(roots);
     }
 
-    /// <summary>按识别结果重新组织当前文档的层级（一步撤销）。</summary>
+    /// <summary>按识别结果重新组织当前文档的层级（一步撤销）。识别时新建的上级分组一起加进文档。</summary>
     public void ApplyHierarchy(Geo.HierarchyDetection detection)
     {
         var map = detection.ParentMap();
+        var created = detection.UsedGroups();
         int changed = map.Count(kv => !ReferenceEquals(kv.Key.Parent, kv.Value));
-        if (changed == 0)
+        if (changed == 0 && created.Count == 0)
         {
             Say("层级没有变化。");
             return;
         }
-        Doc.Edit("识别层级结构", () => Doc.Restructure(map));
-        Say($"已调整 {changed:N0} 个要素的上级，可以撤销。");
+        // 新建的分组先放在根级，再由 Restructure 按识别结果挂到各自的上级下
+        var groupParents = new Dictionary<GeoNode, GeoNode?>(ReferenceEqualityComparer.Instance);
+        foreach (var g in created) groupParents[g] = g.Parent;
+        Doc.Edit("识别层级结构", () =>
+        {
+            foreach (var g in created)
+            {
+                g.Parent = null;
+                g.ChildList.Clear();
+                Doc.Add(g, null);
+            }
+            foreach (var (g, p) in groupParents) map[g] = p;
+            Doc.Restructure(map);
+        });
+        Say(created.Count > 0
+            ? $"已调整 {changed:N0} 个要素的上级，新建了 {created.Count:N0} 个上级分组（范围由下级自动拼成），可以撤销。"
+            : $"已调整 {changed:N0} 个要素的上级，可以撤销。");
     }
 
     /// <param name="hierarchy">是否写入层级字段；为 null 时按文档的设置（见 <see cref="GeoDocument.WritesHierarchy"/>）。</param>
@@ -292,6 +328,43 @@ public sealed class Editor
         Doc.Edit("新建分组", () => Doc.Add(node, parent));
         Doc.Select(node);
         return node;
+    }
+
+    /// <summary>
+    /// 编组：为所选要素新建一个共同的上级分组（放在它们的最近公共上级下、第一个所选要素的位置）。
+    /// 分组没有自身的边界，地图上由下级自动拼出范围，缩小时整块显示。没有选择时新建一个空分组。
+    /// </summary>
+    public GeoNode GroupSelection()
+    {
+        var roots = SelectedRoots();
+        if (roots.Count == 0) return NewGroup(SuggestDrawTarget(Doc.Primary));
+        var parent = GeoDocument.CommonAncestor(roots);
+        // 公共上级是所选要素之一的上级链上的节点；插在第一个所选要素（或它在公共上级下的祖先）的位置
+        GeoNode anchor = roots[0];
+        while (anchor.Parent != parent && anchor.Parent != null) anchor = anchor.Parent;
+        int index = Doc.IndexOf(anchor);
+        var levels = roots.Select(n => LevelTiers.Of(n)).ToList();
+        string level = "";
+        if (levels.All(t => t != null) && levels.Distinct().Count() == 1)
+        {
+            level = levels[0] switch
+            {
+                1 => "国家",
+                2 => "省",
+                3 => "市",
+                4 => "区县",
+                _ => "",
+            };
+        }
+        var group = new GeoNode(Doc.NewId("g")) { Name = DefaultName(NodeKind.Group), Level = level };
+        Doc.Edit("编组", () =>
+        {
+            Doc.Add(group, parent, index);
+            foreach (var n in roots) Doc.Move(n, group);
+        });
+        Doc.Select(group);
+        Say($"已把 {roots.Count} 个要素编为「{group.DisplayName}」，它的范围由下级自动拼成。可以在右侧改名。");
+        return group;
     }
 
     // ───────────────────────── 剪贴板 ─────────────────────────
@@ -529,8 +602,10 @@ public sealed class Editor
     /// <summary>
     /// 确定切割对象的第一步（UI 线程）。选中了要素时只切选中的（划分下级模式下，已有下级的切它的下级）；
     /// 什么都没选时，候选是包围盒与切割线相交的全部可见面和线，之后只保留最底层的。
+    /// <paramref name="scope"/> 是地图上当前显示着的那一级（按层级缩放显示时）：只在其中找候选，
+    /// 缩小时切的是合并显示的上级（它的下级跟着切开），而不是看不见的最底层。
     /// </summary>
-    public CutPlan PlanCut(Envelope cutterEnvelope)
+    public CutPlan PlanCut(Envelope cutterEnvelope, IReadOnlySet<GeoNode>? scope = null)
     {
         static CutCandidate Candidate(GeoNode n) => new(n, n.Geometry!, n.Kind, n.Ancestors().ToArray());
 
@@ -550,7 +625,8 @@ public sealed class Editor
         if (selected.Count > 0) return new CutPlan(selected.Select(Candidate).ToList(), null, false);
 
         var candidates = Doc.AllNodes()
-            .Where(n => n.Kind is NodeKind.Polygon or NodeKind.Line && n.Geometry!.EnvelopeInternal.Intersects(cutterEnvelope) && n.IsEffectivelyVisible)
+            .Where(n => n.Kind is NodeKind.Polygon or NodeKind.Line && (scope == null || scope.Contains(n))
+                        && n.Geometry!.EnvelopeInternal.Intersects(cutterEnvelope) && n.IsEffectivelyVisible)
             .Select(Candidate)
             .ToList();
         return new CutPlan(candidates, null, true);
@@ -595,16 +671,17 @@ public sealed class Editor
         return result;
     }
 
-    private List<GeoNode> CutTargets(LineString cutter, out GeoNode? subdivideParent)
+    private List<GeoNode> CutTargets(LineString cutter, IReadOnlySet<GeoNode>? scope, out GeoNode? subdivideParent)
     {
-        var plan = PlanCut(cutter.EnvelopeInternal);
+        var plan = PlanCut(cutter.EnvelopeInternal, scope);
         subdivideParent = plan.SubdivideParent;
         return ResolveCutTargets(plan, cutter);
     }
 
-    public void Cut(LineString cutter)
+    /// <param name="scope">没有选择时在哪些要素里找切割对象（地图上当前显示着的那一级）；为 null 时是全部可见要素。</param>
+    public void Cut(LineString cutter, IReadOnlySet<GeoNode>? scope = null)
     {
-        var targets = CutTargets(cutter, out var subdivideParent);
+        var targets = CutTargets(cutter, scope, out var subdivideParent);
         if (targets.Count == 0)
         {
             Say("切割线没有穿过可以切割的面或线。");

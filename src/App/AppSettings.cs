@@ -14,7 +14,13 @@ public sealed class AppSettings
     public bool BaseMapGray { get; set; }
     public string DataCrs { get; set; } = "wgs84";
     public bool ShowLabels { get; set; } = true;
-    public bool ClusterPoints { get; set; } = true;
+
+    /// <summary>点标记的显示方式（见 <see cref="App.PointDisplay"/>）。</summary>
+    public App.PointDisplay PointDisplay { get; set; } = App.PointDisplay.Declutter;
+
+    /// <summary>按层级缩放显示，以及层级展开的早晚（0 到 1）。</summary>
+    public bool RegionLod { get; set; } = true;
+    public double LodDetail { get; set; } = 0.5;
 
     /// <summary>启动时自动检查 GitHub 上的新版本（每天最多一次）。</summary>
     public bool AutoCheckUpdates { get; set; } = true;
@@ -29,6 +35,10 @@ public sealed class AppSettings
     /// <summary>识别层级时是否用属性字段、空间包含关系（记住上次的选择）。</summary>
     public bool DetectByAttributes { get; set; } = true;
     public bool DetectBySpace { get; set; } = true;
+
+    /// <summary>识别层级时新建数据里缺少的上级、按政权字段建最上一级（记住上次的选择）。</summary>
+    public bool DetectCreateMissing { get; set; } = true;
+    public bool DetectGroupTop { get; set; } = true;
 
     public List<string> RecentFiles { get; set; } = new();
 
@@ -56,13 +66,18 @@ public sealed class AppSettings
             s.BaseMapGray = (bool?)o["baseMapGray"] ?? false;
             s.DataCrs = (string?)o["dataCrs"] ?? s.DataCrs;
             s.ShowLabels = (bool?)o["showLabels"] ?? true;
-            s.ClusterPoints = (bool?)o["clusterPoints"] ?? true;
+            if (Enum.TryParse<App.PointDisplay>((string?)o["pointDisplay"], out var pd)) s.PointDisplay = pd;
+            else if ((bool?)o["clusterPoints"] == false) s.PointDisplay = App.PointDisplay.All;
+            s.RegionLod = (bool?)o["regionLod"] ?? true;
+            s.LodDetail = Math.Clamp((double?)o["lodDetail"] ?? 0.5, 0, 1);
             s.AutoCheckUpdates = (bool?)o["autoCheckUpdates"] ?? true;
             if (DateTime.TryParse((string?)o["lastUpdateCheck"], System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var last)) s.LastUpdateCheck = last;
             s.SkippedVersion = (string?)o["skippedVersion"] ?? "";
             s.AskHierarchyOnOpen = (bool?)o["askHierarchyOnOpen"] ?? true;
             s.DetectByAttributes = (bool?)o["detectByAttributes"] ?? true;
             s.DetectBySpace = (bool?)o["detectBySpace"] ?? true;
+            s.DetectCreateMissing = (bool?)o["detectCreateMissing"] ?? true;
+            s.DetectGroupTop = (bool?)o["detectGroupTop"] ?? true;
             if (o["recentFiles"] is JsonArray arr)
             {
                 s.RecentFiles = arr.Select(x => (string?)x).OfType<string>().Where(File.Exists).Take(8).ToList();
@@ -86,13 +101,17 @@ public sealed class AppSettings
                 ["baseMapGray"] = BaseMapGray,
                 ["dataCrs"] = DataCrs,
                 ["showLabels"] = ShowLabels,
-                ["clusterPoints"] = ClusterPoints,
+                ["pointDisplay"] = PointDisplay.ToString(),
+                ["regionLod"] = RegionLod,
+                ["lodDetail"] = LodDetail,
                 ["autoCheckUpdates"] = AutoCheckUpdates,
                 ["lastUpdateCheck"] = LastUpdateCheck.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
                 ["skippedVersion"] = SkippedVersion,
                 ["askHierarchyOnOpen"] = AskHierarchyOnOpen,
                 ["detectByAttributes"] = DetectByAttributes,
                 ["detectBySpace"] = DetectBySpace,
+                ["detectCreateMissing"] = DetectCreateMissing,
+                ["detectGroupTop"] = DetectGroupTop,
                 ["recentFiles"] = new JsonArray(RecentFiles.Select(f => (JsonNode?)JsonValue.Create(f)).ToArray()),
             };
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);

@@ -41,11 +41,45 @@ public sealed class ProjectedShape
     private double[][]? _chunks;
     private bool _labelReady;
     private double _labelX, _labelY, _labelRadius;
+    private double _labelAngle, _labelElongation = 1;
+    private double _area = -1;
 
     public bool Intersects(double minX, double minY, double maxX, double maxY)
         => MaxX >= minX && MinX <= maxX && MaxY >= minY && MinY <= maxY;
 
     public double Extent => Math.Max(MaxX - MinX, MaxY - MinY);
+
+    /// <summary>面积（世界坐标单位的平方）：各个面的外环减内环；线和点为 0。</summary>
+    public double Area
+    {
+        get
+        {
+            if (_area >= 0) return _area;
+            double a = 0;
+            if (Kind == NodeKind.Polygon)
+            {
+                for (int p = 0, k = 0; p < RingCounts.Length; k += RingCounts[p], p++)
+                {
+                    a += Math.Abs(SignedArea(Paths[k]));
+                    for (int h = 1; h < RingCounts[p]; h++) a -= Math.Abs(SignedArea(Paths[k + h]));
+                }
+            }
+            return _area = Math.Max(a, 0);
+        }
+    }
+
+    /// <summary>
+    /// 最大一块的主轴方向（弧度，0 为水平，向下为正）和长短轴之比。区域名称据此横排、竖排或沿斜向排开。
+    /// 与 <see cref="Label"/> 一起计算。
+    /// </summary>
+    public (double Angle, double Elongation) LabelAxis
+    {
+        get
+        {
+            _ = Label;
+            return (_labelAngle, _labelElongation);
+        }
+    }
 
     /// <summary>
     /// 某一级简化后的路径，与 <see cref="Paths"/> 一一对应；面积小于容差的环为 null。
@@ -149,6 +183,7 @@ public sealed class ProjectedShape
             }
         }
         if (best < 0) return;
+        ComputeAxis(paths[bestStart] ?? Paths[bestStart]);
 
         try
         {
@@ -183,6 +218,39 @@ public sealed class ProjectedShape
         {
             // 退化的环：用包围盒中心
         }
+    }
+
+    /// <summary>用环的二阶面积矩求主轴方向和长短轴之比（坐标先减去包围盒中心，避免数值问题）。</summary>
+    private void ComputeAxis(double[] xy)
+    {
+        int n = xy.Length / 2;
+        if (n < 4) return;
+        double ox = (MinX + MaxX) / 2, oy = (MinY + MaxY) / 2;
+        double a = 0, cx = 0, cy = 0, sxx = 0, syy = 0, sxy = 0;
+        for (int i = 0, j = n - 1; i < n; j = i++)
+        {
+            double x0 = xy[j * 2] - ox, y0 = xy[j * 2 + 1] - oy, x1 = xy[i * 2] - ox, y1 = xy[i * 2 + 1] - oy;
+            double cross = x0 * y1 - x1 * y0;
+            a += cross;
+            cx += (x0 + x1) * cross;
+            cy += (y0 + y1) * cross;
+            sxx += (x0 * x0 + x0 * x1 + x1 * x1) * cross;
+            syy += (y0 * y0 + y0 * y1 + y1 * y1) * cross;
+            sxy += (x0 * y1 + 2 * x0 * y0 + 2 * x1 * y1 + x1 * y0) * cross;
+        }
+        a /= 2;
+        if (Math.Abs(a) < 1e-30) return;
+        cx /= 6 * a;
+        cy /= 6 * a;
+        // 相对形心的协方差（除以面积）
+        double ixx = sxx / 12 / a - cx * cx;
+        double iyy = syy / 12 / a - cy * cy;
+        double ixy = sxy / 24 / a - cx * cy;
+        double tr = ixx + iyy, det = ixx * iyy - ixy * ixy;
+        double disc = Math.Sqrt(Math.Max(tr * tr / 4 - det, 0));
+        double l1 = tr / 2 + disc, l2 = Math.Max(tr / 2 - disc, 1e-30);
+        _labelAngle = 0.5 * Math.Atan2(2 * ixy, ixx - iyy);
+        _labelElongation = Math.Sqrt(Math.Max(l1, 0) / l2);
     }
 
     private LinearRing? ToLocalRing(double[] xy, double extent)
