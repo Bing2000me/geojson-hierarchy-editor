@@ -42,6 +42,9 @@ public sealed class Editor
     public ObservableValue<double> BaseMapFade { get; } = new(0.35);
     public ObservableValue<bool> BaseMapGray { get; } = new(false);
     public ObservableValue<bool> ShowLabels { get; } = new(true);
+
+    /// <summary>点多时按缩放级别聚合显示（缩小时相邻的点合成一个带数量的圆，放大逐级展开）。</summary>
+    public ObservableValue<bool> ClusterPoints { get; } = new(true);
     public ObservableValue<bool> Snapping { get; } = new(true);
     public ObservableValue<bool> LinkedEditing { get; } = new(true);
     public ObservableValue<bool> ClipToParent { get; } = new(true);
@@ -50,6 +53,12 @@ public sealed class Editor
 
     /// <summary>绘制工具新建的要素挂到哪个节点下（null 表示根级）。选择绘制工具时按当前选择确定。</summary>
     public ObservableValue<GeoNode?> DrawTarget { get; } = new(null);
+
+    /// <summary>
+    /// 正在编辑顶点的面或线（null 表示没有）。选中要素时只高亮，双击、回车或“编辑顶点”按钮才进入顶点编辑，
+    /// 选择变了、换了工具或要素被删除、隐藏时自动退出。
+    /// </summary>
+    public ObservableValue<GeoNode?> VertexEditTarget { get; } = new(null);
 
     /// <summary>提示消息（界面用 toast 显示）。</summary>
     public event Action<string>? Notify;
@@ -61,7 +70,45 @@ public sealed class Editor
     {
         Tool.Changed += OnToolChanged;
         Doc.SelectionChanged += ClearHighlights;
-        Doc.Changed += _ => ClearHighlights();
+        Doc.SelectionChanged += CheckVertexEdit;
+        Doc.Changed += _ =>
+        {
+            ClearHighlights();
+            CheckVertexEdit();
+        };
+    }
+
+    // ───────────────────────── 顶点编辑 ─────────────────────────
+
+    /// <summary>能不能编辑这个要素的顶点：文档里可见的面或线。</summary>
+    public bool CanEditVertices(GeoNode? node)
+        => node is { Kind: NodeKind.Polygon or NodeKind.Line } && ReferenceEquals(Doc.Find(node.Id), node) && node.IsEffectivelyVisible;
+
+    /// <summary>当前选择能不能进入顶点编辑（单选一个面或线）。</summary>
+    public GeoNode? VertexEditCandidate => Doc.Selection.Count == 1 && CanEditVertices(Doc.Selection[0]) ? Doc.Selection[0] : null;
+
+    public void BeginVertexEdit(GeoNode? node = null)
+    {
+        node ??= VertexEditCandidate;
+        if (!CanEditVertices(node)) return;
+        if (Tool.Value != EditTool.Select) Tool.Value = EditTool.Select;
+        Doc.Select(node);
+        VertexEditTarget.Value = node;
+    }
+
+    public void EndVertexEdit()
+    {
+        if (VertexEditTarget.Value != null) VertexEditTarget.Value = null;
+    }
+
+    private void CheckVertexEdit()
+    {
+        var target = VertexEditTarget.Value;
+        if (target == null) return;
+        if (Tool.Value != EditTool.Select || !CanEditVertices(target) || Doc.Selection.Count != 1 || !ReferenceEquals(Doc.Selection[0], target))
+        {
+            VertexEditTarget.Value = null;
+        }
     }
 
     private void ClearHighlights()
@@ -80,6 +127,7 @@ public sealed class Editor
 
     private void OnToolChanged()
     {
+        CheckVertexEdit();
         if (Tool.Value is EditTool.DrawPoint or EditTool.DrawLine or EditTool.DrawPolygon)
         {
             DrawTarget.Value = SuggestDrawTarget(Doc.Primary);
@@ -121,18 +169,23 @@ public sealed class Editor
 
     public void NewDocument()
     {
-        Doc.Load(Array.Empty<GeoNode>(), null);
+        Doc.Load(Array.Empty<GeoNode>(), null, writesHierarchy: true);
     }
 
     public ReadResult Open(string path)
     {
         var result = GeoJsonIO.ReadFile(path);
-        Doc.Load(result.Roots, path);
+        Load(result, path);
         return result;
     }
 
-    /// <summary>用已经读好的内容替换文档（大文件在后台线程读取，回到 UI 线程后调用）。</summary>
-    public void Load(ReadResult result, string? path) => Doc.Load(result.Roots, path);
+    /// <summary>
+    /// 用已经读好的内容替换文档（大文件在后台线程读取，回到 UI 线程后调用）。
+    /// <paramref name="roots"/> 为按识别结果整理过的树，为 null 时用读入的原样。
+    /// 文件本来没有层级字段时，保存默认保持原有字段（见 <see cref="GeoDocument.WritesHierarchy"/>）。
+    /// </summary>
+    public void Load(ReadResult result, string? path, IReadOnlyList<GeoNode>? roots = null)
+        => Doc.Load(roots ?? result.Roots, path, result.HasHierarchyFields);
 
     /// <summary>把文件导入到指定节点下（null 为根级）。</summary>
     public ReadResult Import(string path, GeoNode? parent)
@@ -142,22 +195,51 @@ public sealed class Editor
         return result;
     }
 
-    /// <summary>把已经读好的要素加到指定节点下，作为一步撤销。</summary>
-    public void AddImported(IReadOnlyList<GeoNode> roots, GeoNode? parent)
+    /// <summary>
+    /// 把已经读好的要素加到文档里，作为一步撤销。自动识别过层级时，根的 Parent 可能指向文档里已有的要素，
+    /// 就挂到那里；其余的挂到 <paramref name="target"/> 下（null 为根级）。
+    /// </summary>
+    public void AddImported(IReadOnlyList<GeoNode> roots, GeoNode? target)
     {
-        if (parent != null && Doc.Find(parent.Id) != parent) parent = null;
+        if (target != null && Doc.Find(target.Id) != target) target = null;
         Doc.Edit("导入", () =>
         {
-            foreach (var r in roots) Doc.Add(r, parent);
+            foreach (var r in roots)
+            {
+                var parent = r.Parent != null && ReferenceEquals(Doc.Find(r.Parent.Id), r.Parent) ? r.Parent : target;
+                r.Parent = null;
+                Doc.Add(r, parent);
+            }
         });
         Doc.SetSelection(roots);
     }
 
-    public void Save(string path)
+    /// <summary>按识别结果重新组织当前文档的层级（一步撤销）。</summary>
+    public void ApplyHierarchy(Geo.HierarchyDetection detection)
     {
-        GeoJsonIO.WriteFile(path, Doc.Roots);
+        var map = detection.ParentMap();
+        int changed = map.Count(kv => !ReferenceEquals(kv.Key.Parent, kv.Value));
+        if (changed == 0)
+        {
+            Say("层级没有变化。");
+            return;
+        }
+        Doc.Edit("识别层级结构", () => Doc.Restructure(map));
+        Say($"已调整 {changed:N0} 个要素的上级，可以撤销。");
+    }
+
+    /// <param name="hierarchy">是否写入层级字段；为 null 时按文档的设置（见 <see cref="GeoDocument.WritesHierarchy"/>）。</param>
+    public void Save(string path, bool? hierarchy = null)
+    {
+        GeoJsonIO.WriteFile(path, Doc.Roots, hierarchy ?? Doc.WritesHierarchy);
         Doc.FilePath = path;
         Doc.MarkSaved();
+    }
+
+    /// <summary>导出整个文档并保留层级信息（每个要素写入 id、parentId），不改变文档的保存位置。</summary>
+    public void ExportWithHierarchy(string path)
+    {
+        GeoJsonIO.WriteFile(path, Doc.Roots, hierarchy: true);
     }
 
     public void ExportSelection(string path)
@@ -348,6 +430,7 @@ public sealed class Editor
             Icon = n.Icon,
             Visible = n.Visible,
             Extra = n.Extra,
+            Source = n.Source,
             Geometry = n.Geometry,
         };
         foreach (var child in n.Children)

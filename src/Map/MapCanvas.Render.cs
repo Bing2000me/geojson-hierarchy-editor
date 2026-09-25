@@ -86,9 +86,11 @@ public sealed partial class MapCanvas
         }
         DrawSelection(canvas);
         DrawVertexHandles(canvas);
-        DrawMarkers(canvas, visible);
+        DrawPoints(canvas, visible);
         if (_editor.ShowLabels.Value) DrawLabels(canvas, visible);
+        DrawClusterHoverCard(canvas);
         DrawToolOverlay(canvas);
+        DrawVertexHint(canvas);
         DrawScaleAndAttribution(canvas);
 
         canvas.Restore();
@@ -418,42 +420,6 @@ public sealed partial class MapCanvas
 
     // ───────────────────────── 点标记 ─────────────────────────
 
-    private void DrawMarkers(SKCanvas canvas, List<VisibleItem> visible)
-    {
-        int total = 0;
-        foreach (var v in visible)
-        {
-            if (v.Shape.Kind == NodeKind.Point) total += v.Shape.Points.Length / 2;
-        }
-        if (total == 0) return;
-
-        bool dots = total > MarkerDotLimit;
-        bool shadow = total <= MarkerShadowLimit;
-        float w = (float)_vp.Width, h = (float)_vp.Height;
-        foreach (var (node, shape, _) in visible)
-        {
-            if (shape.Kind != NodeKind.Point) continue;
-            bool selected = Doc.IsSelected(node);
-            bool hover = ReferenceEquals(node, _hover);
-            var color = ColorOf(node);
-            for (int i = 0; i < shape.Points.Length; i += 2)
-            {
-                var (x, y) = _vp.WorldToScreen(shape.Points[i], shape.Points[i + 1]);
-                if (x < -40 || y < -40 || x > w + 40 || y > h + 40) continue;
-                if (dots && !selected && !hover)
-                {
-                    _fill.Color = color;
-                    canvas.DrawCircle((float)x, (float)y, 3.6f, _fill);
-                    _stroke.Color = SKColors.White.WithAlpha(220);
-                    _stroke.StrokeWidth = 1.2f;
-                    canvas.DrawCircle((float)x, (float)y, 3.6f, _stroke);
-                    continue;
-                }
-                DrawMarker(canvas, node.Icon, color, (float)x, (float)y, selected, hover, shadow || selected || hover);
-            }
-        }
-    }
-
     /// <summary>画一个点标记。(x, y) 是锚点：图钉和旗帜在底端，其余在中心。</summary>
     private void DrawMarker(SKCanvas canvas, MarkerIcon icon, SKColor color, float x, float y, bool selected, bool hover, bool shadow)
     {
@@ -567,54 +533,69 @@ public sealed partial class MapCanvas
 
     // ───────────────────────── 标注 ─────────────────────────
 
+    /// <summary>
+    /// 标注，按重要度依次占位，放不下的不画（与常见地图软件的做法一致）：
+    /// 选中要素 → 上两级区域 → 点和簇（按层级、人口排序，每个试右、左、上、下四个位置）→ 更深层级的区域 → 线。
+    /// 点标记和簇本身也占位，后放的标注不会压住它们。
+    /// </summary>
     private void DrawLabels(SKCanvas canvas, List<VisibleItem> visible)
     {
         _labelGrid.Clear();
         bool dark = DarkBase;
         var ink = dark ? new SKColor(0xF8, 0xFA, 0xFC) : MapStyle.LabelInk;
         var halo = dark ? new SKColor(0x0B, 0x10, 0x18, 0xD0) : MapStyle.LabelHalo;
-        double s = _vp.WorldSize;
         long start = Stopwatch.GetTimestamp();
         bool pending = false;
 
-        // 点标记的名称优先占位
-        int pointCount = 0;
+        foreach (var label in _pointLabels)
+        {
+            if (label.Force) PlacePointLabel(canvas, label, ink, halo);
+        }
+
+        var polygons = new List<VisibleItem>();
         foreach (var v in visible)
         {
-            if (v.Shape.Kind == NodeKind.Point) pointCount++;
+            if (v.Shape.Kind == NodeKind.Polygon && !string.IsNullOrWhiteSpace(v.Node.Name)) polygons.Add(v);
         }
-        foreach (var (node, shape, _) in visible)
+        // 同一层级里大的先放
+        polygons.Sort((a, b) => a.Depth != b.Depth ? a.Depth.CompareTo(b.Depth) : b.Shape.LabelRadiusBound.CompareTo(a.Shape.LabelRadiusBound));
+
+        // 点标记和簇先占位：区域名称不压住它们（放不下时在区域内挪一挪位置）
+        foreach (var m in _shownMarkers)
         {
-            if (shape.Kind != NodeKind.Point || string.IsNullOrWhiteSpace(node.Name)) continue;
-            // 点很多时只给选中的写名字，其余靠碰撞检测挑着放
-            if (pointCount > MarkerDotLimit && !Doc.IsSelected(node)) continue;
-            var (lx, ly, _) = shape.Label;
-            var (x, y) = _vp.WorldToScreen(lx, ly);
-            float anchorY = node.Icon is MarkerIcon.Pin or MarkerIcon.Flag ? (float)y - 16 : (float)y;
-            TryDrawLabel(canvas, node.Name, (float)x + 15, anchorY, 12.5f, false, SKTextAlign.Left, ink, halo, Doc.IsSelected(node));
+            var (x, y) = _vp.WorldToScreen(m.X, m.Y);
+            _labelGrid.Add(MarkerHitRect(m.Node.Icon, x, y));
+        }
+        foreach (var c in _shownClusters)
+        {
+            var (x, y) = _vp.WorldToScreen(c.X, c.Y);
+            float r = c.Radius + 2;
+            _labelGrid.Add(new SKRect((float)x - r, (float)y - r, (float)x + r, (float)y + r));
         }
 
-        foreach (var (node, shape, depth) in visible.Where(v => v.Shape.Kind == NodeKind.Polygon).OrderBy(v => v.Depth))
+        int p = 0;
+        for (; p < polygons.Count && polygons[p].Depth <= 1; p++)
         {
-            if (string.IsNullOrWhiteSpace(node.Name)) continue;
-            // 先用包围盒排除肯定放不下的，省掉内切圆计算
-            if (shape.LabelRadiusBound * s < 14) continue;
-            if (!shape.HasLabel && Stopwatch.GetElapsedTime(start).TotalMilliseconds > LabelBudgetMs)
+            pending |= !TryPolygonLabel(canvas, polygons[p], ink, halo, start);
+        }
+
+        if (_pointLabels.Count > 0)
+        {
+            var order = new List<PointLabel>(_pointLabels.Count);
+            foreach (var label in _pointLabels)
             {
-                pending = true;
-                continue;
+                if (!label.Force) order.Add(label);
             }
-            var (lx, ly, radius) = shape.Label;
-            double radiusPx = radius * s;
-            if (radiusPx < 14) continue;
-            float size = depth switch { 0 => 15.5f, 1 => 13.5f, _ => 12.5f };
-            bool bold = depth <= 1;
-            float w = Font(size, bold).MeasureText(node.Name);
-            if (w > radiusPx * 2.6) continue;
-            var (x, y) = _vp.WorldToScreen(lx, ly);
-            TryDrawLabel(canvas, node.Name, (float)x, (float)y + size * 0.35f, size, bold, SKTextAlign.Center, ink, halo, Doc.IsSelected(node));
+            order.Sort((a, b) => a.Rank != b.Rank ? a.Rank.CompareTo(b.Rank) : b.Count.CompareTo(a.Count));
+            foreach (var label in order) PlacePointLabel(canvas, label, ink, halo);
         }
 
+        for (; p < polygons.Count; p++)
+        {
+            pending |= !TryPolygonLabel(canvas, polygons[p], ink, halo, start);
+        }
+
+        double s = _vp.WorldSize;
         foreach (var (node, shape, _) in visible)
         {
             if (shape.Kind != NodeKind.Line || string.IsNullOrWhiteSpace(node.Name)) continue;
@@ -628,6 +609,87 @@ public sealed partial class MapCanvas
         if (pending) QueueRedraw();
     }
 
+    /// <summary>面的名称放在最大内切圆的圆心，圆太小、字放不下时不画。返回 false 表示超出本帧的计算时间，留到下一帧。</summary>
+    private bool TryPolygonLabel(SKCanvas canvas, VisibleItem item, SKColor ink, SKColor halo, long start)
+    {
+        var (node, shape, depth) = item;
+        double s = _vp.WorldSize;
+        // 先用包围盒排除肯定放不下的，省掉内切圆计算
+        if (shape.LabelRadiusBound * s < 14) return true;
+        if (!shape.HasLabel && Stopwatch.GetElapsedTime(start).TotalMilliseconds > LabelBudgetMs) return false;
+        var (lx, ly, radius) = shape.Label;
+        double radiusPx = radius * s;
+        if (radiusPx < 14) return true;
+        float size = depth switch { 0 => 15.5f, 1 => 13.5f, _ => 12.5f };
+        bool bold = depth <= 1;
+        float w = Font(size, bold).MeasureText(node.Name);
+        if (w > radiusPx * 2.6) return true;
+        var (x, y) = _vp.WorldToScreen(lx, ly);
+        float baseline = (float)y + size * 0.35f;
+        // 中心被点标记占了时，在内切圆里上下左右挪一挪
+        float dy = (float)Math.Min(radiusPx * 0.55, size * 1.7), dx = (float)Math.Min(radiusPx * 0.5, w * 0.6);
+        Span<(float X, float Y)> offsets = [(0, 0), (0, -dy), (0, dy), (-dx, 0), (dx, 0)];
+        foreach (var (ox, oy) in offsets)
+        {
+            if (TryDrawLabel(canvas, node.Name, (float)x + ox, baseline + oy, size, bold, SKTextAlign.Center, ink, halo, false, w)) return true;
+        }
+        if (Doc.IsSelected(node)) TryDrawLabel(canvas, node.Name, (float)x, baseline, size, bold, SKTextAlign.Center, ink, halo, true, w);
+        return true;
+    }
+
+    /// <summary>
+    /// 点或簇的名称：依次试右、左、上、下四个位置，第一个不与已有标注和标记重叠的位置胜出；都不行就不画
+    /// （选中的点除外，放在右边）。字号按层级：都城、省级最大，乡镇、村最小。
+    /// </summary>
+    private void PlacePointLabel(SKCanvas canvas, in PointLabel label, SKColor ink, SKColor halo)
+    {
+        var (size, bold) = label.Tier switch
+        {
+            0 => (13.5f, true),
+            1 => (13f, true),
+            2 => (12.5f, true),
+            3 => (12f, false),
+            4 or 5 => (11.5f, false),
+            _ => (12.5f, false),
+        };
+        var font = Font(size, bold);
+        float w = font.MeasureText(label.Text);
+        float x = label.X, y = label.Y;
+
+        // 标记占的范围（与 MarkerHitRect 一致，相对锚点）和可见中心：图钉、旗帜的锚点在底端
+        float left, right, top, bottom, cx = x, cy = y;
+        if (label.Radius > 0)
+        {
+            left = top = -label.Radius - 2;
+            right = bottom = label.Radius + 2;
+        }
+        else
+        {
+            var r = MarkerHitRect(label.Icon, 0, 0);
+            (left, right, top, bottom) = (r.Left, r.Right, r.Top, r.Bottom);
+            if (label.Icon == MarkerIcon.Pin) cy = y - 20;
+            else if (label.Icon == MarkerIcon.Flag) (cx, cy) = (x + 8, y - 21);
+        }
+        float mid = cy + size * 0.35f;
+
+        Span<(float X, float Baseline, SKTextAlign Align)> candidates =
+        [
+            (x + right + 4, mid, SKTextAlign.Left),
+            (x + left - 4, mid, SKTextAlign.Right),
+            (cx, y + top - 2 - size * 0.3f, SKTextAlign.Center),
+            (cx, y + bottom + 2 + size, SKTextAlign.Center),
+        ];
+        foreach (var (lx, baseline, align) in candidates)
+        {
+            if (TryDrawLabel(canvas, label.Text, lx, baseline, size, bold, align, ink, halo, false, w)) return;
+        }
+        if (label.Force)
+        {
+            var (fx, fb, fa) = candidates[0];
+            TryDrawLabel(canvas, label.Text, fx, fb, size, bold, fa, ink, halo, true, w);
+        }
+    }
+
     private SKFont Font(float size, bool bold)
     {
         if (_fonts.TryGetValue((size, bold), out var font)) return font;
@@ -636,10 +698,10 @@ public sealed partial class MapCanvas
         return font;
     }
 
-    private bool TryDrawLabel(SKCanvas canvas, string text, float x, float baselineY, float size, bool bold, SKTextAlign align, SKColor ink, SKColor halo, bool force)
+    private bool TryDrawLabel(SKCanvas canvas, string text, float x, float baselineY, float size, bool bold, SKTextAlign align, SKColor ink, SKColor halo, bool force, float width = -1)
     {
         var font = Font(size, bold);
-        float w = font.MeasureText(text);
+        float w = width >= 0 ? width : font.MeasureText(text);
         float left = align switch
         {
             SKTextAlign.Center => x - w / 2,

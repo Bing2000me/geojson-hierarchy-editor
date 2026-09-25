@@ -87,16 +87,19 @@ public sealed partial class MapCanvas
 
     public bool IsDrawing => _drawPts.Count > 0;
 
-    /// <summary>当前可编辑顶点的节点：单选的可见面或线。</summary>
+    /// <summary>正在编辑顶点的面或线（双击、回车或“编辑顶点”按钮进入）。只是选中时不显示顶点手柄。</summary>
     private GeoNode? EditableNode
     {
         get
         {
-            if (_editor.Tool.Value != EditTool.Select || Doc.Selection.Count != 1) return null;
-            var n = Doc.Selection[0];
-            return n.Kind is NodeKind.Polygon or NodeKind.Line && n.IsEffectivelyVisible ? n : null;
+            if (_editor.Tool.Value != EditTool.Select) return null;
+            var n = _editor.VertexEditTarget.Value;
+            return n != null && _editor.CanEditVertices(n) ? n : null;
         }
     }
+
+    // 双击的第一下单击可能已经把选择轮换到了上一级，双击时要知道单击之前选的是什么
+    private List<GeoNode> _selectionBeforeClick = new();
 
     public void CancelInteraction()
     {
@@ -133,8 +136,10 @@ public sealed partial class MapCanvas
                 ? "画一条完整穿过要素的切割线：从要素外面开始单击。"
                 : "继续单击；切割线穿出要素后双击或按回车执行切割，Esc 取消。",
             _ => EditableNode != null
-                ? "拖动白色顶点修改形状，拖动边中间的小圆点插入顶点，右键顶点删除。顶点很多时放大后才显示。"
-                : "单击选择要素，再次单击同一位置选中上一级；Shift 或 ⌘/Ctrl 单击多选；拖动空白处平移，滚轮缩放。",
+                ? "编辑顶点：拖动白色方块移动顶点，拖动边中间的小圆点插入顶点，右键或双击顶点删除。按回车或 Esc 完成。"
+                : _editor.VertexEditCandidate != null
+                    ? "双击要素或按回车编辑顶点；再次单击同一位置选中上一级；Shift 或 ⌘/Ctrl 单击多选。"
+                    : "单击选择要素，再次单击同一位置选中上一级；Shift 或 ⌘/Ctrl 单击多选；拖动空白处平移，滚轮缩放。",
         };
         HintChanged?.Invoke(hint);
     }
@@ -293,9 +298,21 @@ public sealed partial class MapCanvas
                 FinishDrawing();
                 break;
             case EditTool.Select:
-                if (EditableNode is { } node && HitHandle(node, p) is { IsMid: false } h)
+                if (_lastClickWasCluster)
                 {
-                    DeleteVertex(node, h);
+                    // 第一下单击已经放大展开了簇，第二下不再处理
+                    _lastClickWasCluster = false;
+                    break;
+                }
+                if (EditableNode is { } node)
+                {
+                    // 编辑顶点中：双击顶点删除，双击别处不做什么（单击已经处理了退出）
+                    if (HitHandle(node, p) is { IsMid: false } h) DeleteVertex(node, h);
+                    break;
+                }
+                if (DoubleClickTarget(p) is { } target)
+                {
+                    _editor.BeginVertexEdit(target);
                 }
                 else
                 {
@@ -325,11 +342,12 @@ public sealed partial class MapCanvas
         base.OnMouseLeave();
         _mouseInside = false;
         PointerMoved?.Invoke(null);
-        if (_hover != null || _vertexHover != null || _snap != null)
+        if (_hover != null || _vertexHover != null || _snap != null || _clusterHover != null)
         {
             _hover = null;
             _vertexHover = null;
             _snap = null;
+            UpdateClusterHover(null);
             InvalidateVisual();
         }
     }
@@ -448,8 +466,38 @@ public sealed partial class MapCanvas
 
     private void ClickSelect(Point p, ModifierKeys modifiers)
     {
-        var hits = HitTestAll(p.X, p.Y);
         bool additive = (modifiers & (ModifierKeys.Shift | ModifierKeys.Control | ModifierKeys.Meta)) != 0;
+        _lastClickWasCluster = false;
+        _selectionBeforeClick = Doc.Selection.ToList();
+
+        // 单击簇：放大展开；Shift 或 ⌘/Ctrl 单击把簇里的点加入或移出选择
+        if (HitCluster(p) is { } cluster)
+        {
+            _lastClickWasCluster = true;
+            var members = ClusterMembers(cluster);
+            if (!additive)
+            {
+                ExpandCluster(cluster);
+            }
+            else if (members.All(Doc.IsSelected))
+            {
+                Doc.SetSelection(Doc.Selection.Where(n => !members.Contains(n)).ToList());
+            }
+            else
+            {
+                Doc.SetSelection(Doc.Selection.Concat(members).ToList());
+            }
+            return;
+        }
+
+        var hits = HitTestAll(p.X, p.Y);
+
+        // 编辑顶点中：单击正在编辑的要素内部不改变选择（不会逐级选到上级），点到别处才退出
+        if (EditableNode is { } editing && !additive && hits.Contains(editing) && (ReferenceEquals(hits[0], editing) || hits[0].Kind == NodeKind.Polygon))
+        {
+            return;
+        }
+
         if (hits.Count == 0)
         {
             if (!additive) Doc.ClearSelection();
@@ -475,6 +523,19 @@ public sealed partial class MapCanvas
         Doc.Select(hits[0]);
     }
 
+    /// <summary>
+    /// 双击要编辑顶点的要素：双击的第一下单击可能已经把选择轮换到了上一级，
+    /// 所以先看单击之前选中的要素是否就在鼠标下，其次才是当前选中的。
+    /// </summary>
+    private GeoNode? DoubleClickTarget(Point p)
+    {
+        var hits = HitTestAll(p.X, p.Y);
+        if (hits.Count == 0) return null;
+        if (_selectionBeforeClick is [var before] && hits.Contains(before) && _editor.CanEditVertices(before)) return before;
+        if (Doc.Selection is [var current] && hits.Contains(current) && _editor.CanEditVertices(current)) return current;
+        return null;
+    }
+
     private void OnRightClick(Point p)
     {
         switch (_editor.Tool.Value)
@@ -486,6 +547,13 @@ public sealed partial class MapCanvas
                 if (EditableNode is { } node && HitHandle(node, p) is { IsMid: false } h)
                 {
                     DeleteVertex(node, h);
+                    return;
+                }
+                // 右键簇：选中簇里的全部点，再弹出菜单（可以一起删除、复制、改颜色）
+                if (HitCluster(p) is { } cluster)
+                {
+                    Doc.SetSelection(ClusterMembers(cluster));
+                    ContextRequested?.Invoke(p);
                     return;
                 }
                 // 右键先选中鼠标下的要素，再弹出上下文菜单（由外层处理）
@@ -514,13 +582,15 @@ public sealed partial class MapCanvas
                 _vertexHover = handle;
                 changed = true;
             }
-            var hover = handle != null ? null : HitTestAll(p.X, p.Y).FirstOrDefault();
+            var cluster = handle == null ? HitCluster(p) : null;
+            changed |= UpdateClusterHover(cluster);
+            var hover = handle != null || cluster != null ? null : HitTestAll(p.X, p.Y).FirstOrDefault();
             if (!ReferenceEquals(hover, _hover))
             {
                 _hover = hover;
                 changed = true;
             }
-            Cursor = handle != null ? CursorType.Hand : CursorType.Arrow;
+            Cursor = handle != null || cluster != null ? CursorType.Hand : CursorType.Arrow;
         }
         else
         {
@@ -1101,11 +1171,7 @@ public sealed partial class MapCanvas
         if (shape == null) return;
 
         var handles = VisibleHandles(shape);
-        if (handles == null)
-        {
-            if (_handleHint.Length > 0 && _drag == DragMode.None) DrawBadge(canvas, _handleHint, (float)(_vp.Width / 2), 74);
-            return;
-        }
+        if (handles == null) return;
 
         // 边中点
         if (_drag == DragMode.None)
@@ -1142,6 +1208,14 @@ public sealed partial class MapCanvas
             _stroke.StrokeWidth = 1.6f;
             canvas.DrawRoundRect(rect, 1.5f, 1.5f, _stroke);
         }
+    }
+
+    /// <summary>编辑顶点时顶点太多、没显示手柄的提示，画在最上层（点标记和标注之上），位于工具条下方。</summary>
+    private void DrawVertexHint(SKCanvas canvas)
+    {
+        var node = EditableNode;
+        if (node == null || _drag != DragMode.None || _shapes.Get(node, _vp) is not { } shape) return;
+        if (VisibleHandles(shape) == null && _handleHint.Length > 0) DrawBadge(canvas, _handleHint, (float)(_vp.Width / 2), 68);
     }
 
     /// <summary>地图上方居中的小提示条。</summary>

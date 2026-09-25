@@ -28,6 +28,33 @@ if (args.Length >= 2 && args[0] == "bench")
     return 0;
 }
 
+if (args.Length >= 2 && args[0] == "detect")
+{
+    // 把几个文件当作一个文档（像依次导入那样）读进来，识别层级并打印结果
+    var watch = Stopwatch.StartNew();
+    var nodes = new List<GeoNode>();
+    foreach (var file in args.Skip(1))
+    {
+        var rr = GeoJsonIO.ReadFile(file);
+        nodes.AddRange(rr.Roots.SelectMany(x => x.SelfAndDescendants()));
+        Console.WriteLine($"{Path.GetFileName(file)}：{rr.FeatureCount:N0} 个要素，已有 {rr.LinkedCount:N0} 个上下级");
+    }
+    Console.WriteLine($"读取 {watch.ElapsedMilliseconds} ms");
+    watch.Restart();
+    var det = HierarchyDetector.Detect(nodes, nodes, new DetectOptions());
+    Console.WriteLine($"识别 {watch.ElapsedMilliseconds} ms；规则：{string.Join("、", det.Rules)}");
+    var levelRows = det.LevelSummary(out int pts);
+    foreach (var (name, count) in levelRows) Console.WriteLine($"  {name,-10} {count,6:N0}");
+    Console.WriteLine($"  点标记     {pts,6:N0}");
+    Console.WriteLine($"  已确认关系 {det.ConfirmedLinks,6:N0}  待确认 {det.Count(LinkStatus.Pending):N0}  存在冲突 {det.Count(LinkStatus.Conflict):N0}  无上级 {det.Proposals.Count(p => p.Chosen == null):N0}");
+    foreach (var g in det.Proposals.Where(p => p.Status is LinkStatus.Pending or LinkStatus.Conflict).GroupBy(p => p.Status))
+    {
+        Console.WriteLine($"── {g.Key}（{g.Count()}）");
+        foreach (var p in g.Take(12)) Console.WriteLine($"    {p.Node.DisplayName}（{p.Node.Level}）→ {p.Chosen?.DisplayName ?? "无"}：{p.Reason}");
+    }
+    return 0;
+}
+
 int fails = 0;
 void Check(bool ok, string what) { Console.WriteLine((ok ? "  ok   " : "  FAIL ") + what); if (!ok) fails++; }
 void Section(string title) => Console.WriteLine("\n── " + title);
@@ -333,6 +360,199 @@ var bigClip = edBig.CopySelection()!;
 var parsedBig = GeoClipboard.Parse(bigClip)!;
 Console.WriteLine($"      复制 {edBig.Doc.Selection.Count} 个区县并解析 {sw.ElapsedMilliseconds} ms（{bigClip.Length / 1024} KB）");
 Check(parsedBig.Roots.Count == edBig.Doc.Selection.Count, "大段剪贴板往返");
+
+// ───────────────────────── 9. 点聚合 ─────────────────────────
+Section("点聚合");
+{
+    var rndC = new Random(11);
+    var leafList = new List<PointClusterIndex.Leaf>();
+    var dummy = new GeoNode("x");
+    for (int i = 0; i < 5000; i++)
+    {
+        // 几个密集的城市群，另有一成零散分布的点
+        double cx = 0.80 + (i % 5) * 0.01, cy = 0.40 + (i % 3) * 0.01;
+        double spread = i % 10 == 0 ? 0.05 : 0.002;
+        var color = (i % 4) switch { 0 => SkiaSharp.SKColors.Red, 1 => SkiaSharp.SKColors.Blue, 2 => SkiaSharp.SKColors.Green, _ => SkiaSharp.SKColors.Black };
+        leafList.Add(new PointClusterIndex.Leaf(dummy, i, cx + (rndC.NextDouble() - 0.5) * spread, cy + (rndC.NextDouble() - 0.5) * spread, rndC.Next(0, 6) + (float)rndC.NextDouble() * 0.1f, -1, color));
+    }
+    var swC = Stopwatch.StartNew();
+    var idx = PointClusterIndex.Build(leafList);
+    Console.WriteLine($"      5,000 个点建索引 {swC.ElapsedMilliseconds} ms；第 4 级 {idx.At(4).Length} 簇，第 8 级 {idx.At(8).Length}，第 12 级 {idx.At(12).Length}");
+    bool countsOk = true, parentsOk = true, monotone = true, spacingOk = true;
+    for (int z = 0; z <= PointClusterIndex.MaxLevel; z++)
+    {
+        var level = idx.At(z);
+        var finer = idx.At(z + 1);
+        if (level.Sum(c => c.Count) != leafList.Count) countsOk = false;
+        if (level.Length > finer.Length) monotone = false;
+        foreach (var c in finer)
+        {
+            if (c.Parent < 0 || c.Parent >= level.Length) parentsOk = false;
+        }
+        // 同一级的簇中心之间距离都大于聚合半径
+        if (level.Length <= 1500)
+        {
+            double rad = PointClusterIndex.RadiusDip / (MapViewport.TileSize * Math.Pow(2, z));
+            for (int a = 0; a < level.Length && spacingOk; a++)
+                for (int b = a + 1; b < level.Length; b++)
+                {
+                    double dx = level[a].X - level[b].X, dy = level[a].Y - level[b].Y;
+                    if (dx * dx + dy * dy <= rad * rad) { spacingOk = false; break; }
+                }
+        }
+    }
+    Check(countsOk && parentsOk && monotone, "每一级的簇都由下一级合并而来，数量守恒");
+    Check(spacingOk, "同一级的簇之间的距离都大于聚合半径");
+    Check(idx.At(PointClusterIndex.MaxLevel + 1).Length == leafList.Count && idx.At(2).Length < 20, "最细一级每点一簇，全国级别只剩少数几个簇");
+    var largest = idx.At(6).Select((c, k) => (c, k)).OrderByDescending(x => x.c.Count).First();
+    var members = idx.Members(6, largest.k);
+    Check(members.Count == largest.c.Count && members.Min() == largest.c.Rep, "簇的代表点是成员里最重要的点，簇的位置就是它的位置");
+    int expand = idx.ExpansionLevel(6, largest.k);
+    Check(expand > 6 && idx.At(expand).Count(c => members.Contains(c.Rep)) > 1, $"单击放大到第 {expand} 级时这个簇拆开");
+    Check(largest.c.Mix != null && largest.c.Mix.Sum(m => m.Count) == largest.c.Count && largest.c.Mix.Length == 4, "簇记录成员的颜色构成");
+}
+Check(LevelTiers.FromText("省") == 1 && LevelTiers.FromText("市辖区") == 3 && LevelTiers.FromText("prefecture_seat") == 2
+      && LevelTiers.FromText("街道") == 4 && LevelTiers.FromText("路") == 1 && LevelTiers.FromText("湖泊") == null, "从级别文字推断层级");
+
+// ───────────────────────── 10. 自动识别层级 ─────────────────────────
+Section("自动识别层级");
+{
+    var truth = new Editor();
+    truth.Open(sample);
+    var expected = truth.Doc.AllNodes().ToDictionary(n => n.Id, n => n.Parent?.Id);
+
+    // 把 parentId 换成别的字段名：读进来是平的，层级只能靠识别
+    var flatText = File.ReadAllText(sample).Replace("\"parentId\"", "\"upper_id\"");
+    var flatRead = GeoJsonIO.Read(flatText);
+    var flatNodes = flatRead.Roots.SelectMany(x => x.SelfAndDescendants()).ToList();
+    Check(flatRead.LinkedCount == 0 && !flatRead.HasHierarchyFields && flatNodes.Count == 16, "去掉 parentId 后读入是平的");
+
+    var byAttr = HierarchyDetector.Detect(flatNodes, flatNodes, new DetectOptions(Attributes: true, Spatial: false));
+    Check(byAttr.Rules.Any(r => r.Contains("upper_id")) && byAttr.Proposals.All(p => p.Chosen?.Id == expected[p.Node.Id]),
+        $"按属性：自动找到 upper_id → id，全部 16 个要素的上级正确（{string.Join("、", byAttr.Rules)}）");
+
+    var bySpace = HierarchyDetector.Detect(flatNodes, flatNodes, new DetectOptions(Attributes: false, Spatial: true));
+    var wrong = bySpace.Proposals.Where(p => p.Node.Kind != NodeKind.Line && p.Chosen?.Id != expected[p.Node.Id]).ToList();
+    Check(wrong.Count == 0, $"按空间包含：面和点的上级都与原来一致（不一致 {wrong.Count} 个：{string.Join("、", wrong.Select(p => $"{p.Node.Name}→{p.Chosen?.Name}"))}）");
+    var levels = bySpace.LevelSummary(out int pts);
+    Console.WriteLine("      " + string.Join("  ", levels.Select(l => $"{l.Name} {l.Count}")) + $"  点标记 {pts}；已确认 {bySpace.ConfirmedLinks}，待确认 {bySpace.Count(LinkStatus.Pending)}，冲突 {bySpace.Count(LinkStatus.Conflict)}");
+    Check(levels.Take(3).Select(l => (l.Name, l.Count)).SequenceEqual([("省级", 1), ("市级", 4), ("区县级", 5)]) && pts == 5, "各层级数量：省级 1、市级 4、区县级 5，点标记 5");
+
+    // 应用到还没进文档的要素，再作为一个文档读进来
+    var rebuilt = bySpace.Rebuild(flatNodes);
+    Check(rebuilt.Count(n => n.Kind == NodeKind.Polygon) == 1 && rebuilt[0].Name == "青禾省" && rebuilt[0].Children.Count(c => c.Kind == NodeKind.Polygon) == 4, "按识别结果组织成树");
+
+    // 在文档上重新识别：一步撤销
+    var edH = new Editor();
+    edH.Load(GeoJsonIO.Read(flatText), null);
+    Check(!edH.Doc.WritesHierarchy, "没有层级字段的文件：保存时默认保持原有字段");
+    var all = edH.Doc.AllNodes().ToList();
+    var detDoc = HierarchyDetector.Detect(all, all, new DetectOptions());
+    edH.ApplyHierarchy(detDoc);
+    Check(edH.Doc.Find("d1")!.Parent?.Id == "c1" && edH.Doc.Roots.Count(n => n.Kind == NodeKind.Polygon) == 1 && edH.Doc.UndoLabel == "识别层级结构", "应用到文档（一步撤销）");
+    edH.Doc.Undo();
+    Check(edH.Doc.Roots.Count == 16, "撤销后恢复为平的");
+
+    // 用户改选后形成循环：取消其中一条
+    var cyc = HierarchyDetector.Detect(flatNodes, flatNodes, new DetectOptions(true, false));
+    var pp = cyc.Proposals.First(p => p.Node.Id == "p1");
+    pp.Chosen = cyc.Proposals.First(p => p.Node.Id == "d1").Node;
+    var broken = cyc.BreakCycles();
+    Check(broken.Count == 1, "用户的选择形成循环时自动取消");
+
+    var songDir = "/Users/air/Downloads/Geojson/data/processed/1102_song";
+    if (Directory.Exists(songDir))
+    {
+        var swH = Stopwatch.StartNew();
+        var songNodes = new[] { "admin/level_1", "admin/level_2", "admin/counties", "settlements/seats" }
+            .SelectMany(fn => GeoJsonIO.ReadFile(Path.Combine(songDir, fn + ".geojson")).Roots)
+            .ToList();
+        long tRead2 = swH.ElapsedMilliseconds;
+        swH.Restart();
+        var song = HierarchyDetector.Detect(songNodes, songNodes, new DetectOptions());
+        var songLevels = song.LevelSummary(out int songPts);
+        Console.WriteLine($"      北宋数据 {songNodes.Count:N0} 个要素：读取 {tRead2} ms，识别 {swH.ElapsedMilliseconds} ms；"
+            + string.Join("  ", songLevels.Select(l => $"{l.Name} {l.Count:N0}")) + $"  点标记 {songPts:N0}；已确认 {song.ConfirmedLinks:N0}，待确认 {song.Count(LinkStatus.Pending)}，冲突 {song.Count(LinkStatus.Conflict)}");
+        Check(songLevels.Take(3).Select(l => (l.Name, l.Count)).SequenceEqual([("路级", 24), ("州级", 330), ("县级", 1287)]), "北宋数据：路 → 州 → 县三级");
+        Check(song.ConfirmedLinks > 2800 && song.Count(LinkStatus.Conflict) == 0, "北宋数据：绝大多数关系已确认，没有冲突");
+    }
+}
+
+// ───────────────────────── 11. 保持原有字段 / 写入层级 ─────────────────────────
+Section("保存方式");
+{
+    var srcJson = """
+        {"type":"FeatureCollection","features":[
+        {"type":"Feature","id":7,"properties":{"feature_id":"a1","name_zh":"甲","admin_type":"州","fill":"#ff0000","pop":12},"geometry":{"type":"Polygon","coordinates":[[[0,0],[2,0],[2,2],[0,2],[0,0]]]}},
+        {"type":"Feature","properties":{"feature_id":"b1","name_zh":"乙","admin_type":"县"},"geometry":{"type":"Point","coordinates":[1,1]}}]}
+        """;
+    var edP = new Editor();
+    edP.Load(GeoJsonIO.Read(srcJson), null);
+    var a = edP.Doc.Roots[0];
+    var b = edP.Doc.Roots[1];
+    Check(a.Id == "7" && a.Name == "甲" && a.Level == "州" && a.Color == "#FF0000" && b.Id == "b1" && b.Name == "乙", "名称、级别、id 从 name_zh、admin_type、feature_id 读取");
+    edP.MoveTo([b], a);
+    edP.Rename(a, "甲州");
+    var plain = GeoJsonIO.Write(edP.Doc.Roots, null, hierarchy: false);
+    Check(!plain.Contains("\"parentId\"") && !plain.Contains("\"name\"") && !plain.Contains("\"level\"") && !plain.Contains("\"icon\""),
+        "保持原有字段：不加 parentId、name、level 等字段");
+    Check(plain.Contains("\"name_zh\":\"甲州\"") && plain.Contains("\"id\":7") && plain.Contains("\"fill\":\"#ff0000\"") && plain.Contains("\"pop\":12"),
+        "保持原有字段：改名写回 name_zh，Feature id、颜色、其他属性原样");
+    var native = GeoJsonIO.Write(edP.Doc.Roots, null, hierarchy: true);
+    var back = GeoJsonIO.Read(native);
+    Check(native.Contains("\"parentId\":\"7\"") && back.LinkedCount == 1 && back.HasHierarchyFields, "导出并保留层级信息：写入 id、parentId，读回层级不变");
+
+    edP.Doc.Select(b);
+    edP.DeleteSelection();
+    edP.Doc.Undo();
+    Check(edP.Doc.Find("b1")?.Source?.Fields == SourceFields.None && GeoJsonIO.Write(edP.Doc.Roots, null, false).Contains("\"name_zh\":\"乙\""), "删除再撤销后仍记得原有字段");
+}
+
+// ───────────────────────── 12. 自动更新 ─────────────────────────
+Section("自动更新");
+{
+    Check(UpdateService.ParseVersion("v1.2.0") == new Version(1, 2, 0) && UpdateService.ParseVersion("V2.0") == new Version(2, 0, 0)
+          && UpdateService.ParseVersion("1.3.1-beta") == new Version(1, 3, 1) && UpdateService.ParseVersion("latest") == null, "解析版本号");
+    Check(UpdateService.CurrentVersion >= new Version(1, 2, 0), $"当前版本 {UpdateService.CurrentVersion}");
+    var json = """
+        {"tag_name":"v9.8.7","name":"GeoJSON 层级编辑器 9.8.7","body":"## 新功能\n- 点聚合\n- **自动更新**","html_url":"https://github.com/x/y/releases/tag/v9.8.7","published_at":"2026-09-26T08:00:00Z",
+         "assets":[{"name":"GeoJsonEditor-9.8.7-win-x64.zip","browser_download_url":"https://example.com/win.zip","size":123,"digest":"sha256:ABCDEF"},
+                   {"name":"GeoJsonEditor-9.8.7-macos-arm64.zip","browser_download_url":"https://example.com/mac.zip","size":456}]}
+        """;
+    var win = UpdateService.Parse(json, "win-x64");
+    var mac = UpdateService.Parse(json, "macos-arm64");
+    Check(win.Version == new Version(9, 8, 7) && win.IsNewer && win.Asset!.Url.EndsWith("win.zip") && win.Asset.Sha256 == "abcdef", "解析发布信息：按平台挑安装包，带 SHA-256 摘要");
+    Check(mac.Asset!.Size == 456 && mac.Asset.Sha256 == null && UpdateService.Parse(json, "linux-x64").Asset == null, "没有摘要、没有对应平台安装包的情况");
+
+    // Windows 式替换：旧文件改名为 .old，新文件放到原位，用户自己的文件不动
+    var root = Path.Combine(Path.GetTempPath(), "gje-update-test-" + Guid.NewGuid().ToString("N"));
+    var app = Path.Combine(root, "app");
+    var staged = Path.Combine(root, "staged");
+    Directory.CreateDirectory(Path.Combine(app, "samples"));
+    Directory.CreateDirectory(Path.Combine(staged, "samples"));
+    File.WriteAllText(Path.Combine(app, "GeoJsonEditor.exe"), "old");
+    File.WriteAllText(Path.Combine(app, "samples", "a.geojson"), "old");
+    File.WriteAllText(Path.Combine(app, "我的数据.geojson"), "mine");
+    File.WriteAllText(Path.Combine(staged, "GeoJsonEditor.exe"), "new");
+    File.WriteAllText(Path.Combine(staged, "samples", "a.geojson"), "new");
+    File.WriteAllText(Path.Combine(staged, "使用说明.txt"), "new");
+    UpdateService.ApplyFolder(new PendingUpdate(staged, new InstallTarget(app, false), new Version(9, 9, 9)), Path.Combine(app, "GeoJsonEditor.exe"));
+    Check(File.ReadAllText(Path.Combine(app, "GeoJsonEditor.exe")) == "new" && File.ReadAllText(Path.Combine(app, "samples", "a.geojson")) == "new"
+          && File.ReadAllText(Path.Combine(app, "我的数据.geojson")) == "mine" && File.Exists(Path.Combine(app, "使用说明.txt"))
+          && Directory.GetFiles(app, "GeoJsonEditor.exe.*.old").Length == 1, "替换程序文件夹：新文件到位，旧文件改名备用，用户文件不动");
+
+    // macOS 式替换：整个 .app 换掉
+    var bundle = Path.Combine(root, "编辑器.app");
+    var stagedBundle = Path.Combine(root, "staged2", "编辑器.app");
+    Directory.CreateDirectory(Path.Combine(bundle, "Contents", "MacOS"));
+    Directory.CreateDirectory(Path.Combine(stagedBundle, "Contents", "MacOS"));
+    File.WriteAllText(Path.Combine(bundle, "Contents", "MacOS", "GeoJsonEditor"), "old");
+    File.WriteAllText(Path.Combine(stagedBundle, "Contents", "MacOS", "GeoJsonEditor"), "new");
+    UpdateService.ApplyBundle(new PendingUpdate(stagedBundle, new InstallTarget(bundle, true), new Version(9, 9, 9)));
+    Check(File.ReadAllText(Path.Combine(bundle, "Contents", "MacOS", "GeoJsonEditor")) == "new" && !Directory.Exists(stagedBundle), "替换 .app 包");
+    Directory.Delete(root, recursive: true);
+    UpdateService.Cleanup();
+}
 
 Console.WriteLine(fails == 0 ? "\n全部通过" : $"\n{fails} 项失败");
 return fails;

@@ -13,7 +13,8 @@ using NetTopologySuite.Geometries;
 namespace GeoJsonEditor.IO;
 
 /// <param name="Meta">FeatureCollection 上的 geojsonEditor 字段（本程序复制到剪贴板时写入），没有时为 null。</param>
-public sealed record ReadResult(List<GeoNode> Roots, int FeatureCount, int LinkedCount, List<string> Warnings, JsonObject? Meta = null);
+/// <param name="HasHierarchyFields">是否有要素带 parentId（本程序保存的层级格式）。</param>
+public sealed record ReadResult(List<GeoNode> Roots, int FeatureCount, int LinkedCount, List<string> Warnings, JsonObject? Meta = null, bool HasHierarchyFields = false);
 
 /// <summary>
 /// 带层级的 GeoJSON 读写。层级写在 properties 里：id / parentId。
@@ -29,6 +30,11 @@ public static class GeoJsonIO
     {
         "id", "parentId", "name", "level", "note", "color", "icon", "hidden", "kind",
     };
+
+    // 没有 name、level、id 时依次尝试的字段（这些字段不从属性里拿走，原样保留）
+    private static readonly string[] NameKeys = ["title", "NAME", "Name", "name_zh", "name_cn", "NAME_CHN", "NAME_ZH", "名称", "地名", "name_en"];
+    private static readonly string[] LevelKeys = ["admin_type", "级别", "行政级别", "level_name"];
+    private static readonly string[] IdKeys = ["adcode", "feature_id", "featureId"];
 
     private static readonly JsonDocumentOptions DocOptions = new()
     {
@@ -96,8 +102,10 @@ public static class GeoJsonIO
 
         var items = new List<(GeoNode Node, string? ParentKey)>(features.Count);
         var byId = new Dictionary<string, GeoNode>(StringComparer.Ordinal);
+        var sources = new Dictionary<SourceInfo, SourceInfo>();
         int autoId = 0;
         int badGeometry = 0;
+        bool hasHierarchy = false;
 
         foreach (var f in features)
         {
@@ -106,7 +114,21 @@ public static class GeoJsonIO
             JsonElement? props = isFeature && f.TryGetProperty("properties", out var p) && p.ValueKind == JsonValueKind.Object ? p : null;
             JsonElement? geometry = isFeature ? (f.TryGetProperty("geometry", out var g) ? g : null) : f;
 
-            string? id = Prop(props, "id") ?? (isFeature && f.TryGetProperty("id", out var fid) ? ScalarText(fid) : null) ?? Prop(props, "adcode");
+            var fields = SourceFields.None;
+            JsonNode? featureId = null;
+            string? featureIdText = null;
+            if (isFeature && f.TryGetProperty("id", out var fid) && fid.ValueKind is JsonValueKind.String or JsonValueKind.Number)
+            {
+                featureId = ToNode(fid);
+                featureIdText = ScalarText(fid);
+            }
+            string? id = Prop(props, "id");
+            if (id != null) fields |= SourceFields.Id;
+            id ??= featureIdText;
+            foreach (var key in IdKeys)
+            {
+                id ??= Prop(props, key);
+            }
             if (string.IsNullOrEmpty(id) || byId.ContainsKey(id))
             {
                 do { id = "f" + (++autoId).ToString(CultureInfo.InvariantCulture); } while (byId.ContainsKey(id));
@@ -124,6 +146,11 @@ public static class GeoJsonIO
             }
 
             string? parentKey = Prop(props, "parentId");
+            if (parentKey != null)
+            {
+                fields |= SourceFields.ParentId;
+                hasHierarchy = true;
+            }
             if (parentKey == null && props is { } pp && pp.TryGetProperty("parent", out var parent))
             {
                 parentKey = parent.ValueKind == JsonValueKind.Object
@@ -133,21 +160,91 @@ public static class GeoJsonIO
 
             if (props is { } pr)
             {
-                node.Name = Prop(pr, "name") ?? Prop(pr, "title") ?? Prop(pr, "NAME") ?? "";
-                node.Level = MapLevel(Prop(pr, "level"));
-                node.Note = Prop(pr, "note") ?? Prop(pr, "description") ?? "";
-                node.Color = NormalizeColor(Prop(pr, "color"))
-                             ?? NormalizeColor(Prop(pr, node.Kind switch
-                             {
-                                 NodeKind.Point => "marker-color",
-                                 NodeKind.Line => "stroke",
-                                 _ => "fill",
-                             }));
+                string? nameKey = null, levelKey = null, noteKey = null, colorKey = null, levelRaw = null;
+
+                if (Prop(pr, "name") is { } name)
+                {
+                    node.Name = name;
+                    fields |= SourceFields.Name;
+                }
+                else
+                {
+                    foreach (var key in NameKeys)
+                    {
+                        if (Prop(pr, key) is not { Length: > 0 } alt) continue;
+                        node.Name = alt;
+                        nameKey = key;
+                        break;
+                    }
+                }
+
+                if (Prop(pr, "level") is { } level)
+                {
+                    node.Level = MapLevel(level);
+                    fields |= SourceFields.Level;
+                    if (node.Level != level) levelRaw = level;
+                }
+                else
+                {
+                    foreach (var key in LevelKeys)
+                    {
+                        if (Prop(pr, key) is not { Length: > 0 and <= 24 } alt) continue;
+                        node.Level = alt;
+                        levelKey = key;
+                        break;
+                    }
+                }
+
+                if (Prop(pr, "note") is { } note)
+                {
+                    node.Note = note;
+                    fields |= SourceFields.Note;
+                }
+                else if (Prop(pr, "description") is { } description)
+                {
+                    node.Note = description;
+                    noteKey = "description";
+                }
+
+                if (pr.TryGetProperty("color", out _))
+                {
+                    node.Color = NormalizeColor(Prop(pr, "color"));
+                    fields |= SourceFields.Color;
+                }
+                else
+                {
+                    string styleKey = node.Kind switch
+                    {
+                        NodeKind.Point => "marker-color",
+                        NodeKind.Line => "stroke",
+                        _ => "fill",
+                    };
+                    if (NormalizeColor(Prop(pr, styleKey)) is { } styled)
+                    {
+                        node.Color = styled;
+                        colorKey = styleKey;
+                    }
+                }
+
+                if (pr.TryGetProperty("icon", out _)) fields |= SourceFields.Icon;
                 if (Prop(pr, "icon") is string icon && Enum.TryParse<MarkerIcon>(icon, true, out var mi))
                 {
                     node.Icon = mi;
                 }
-                node.Visible = !(pr.TryGetProperty("hidden", out var hv) && hv.ValueKind == JsonValueKind.True);
+                if (pr.TryGetProperty("hidden", out var hv))
+                {
+                    fields |= SourceFields.Hidden;
+                    node.Visible = hv.ValueKind != JsonValueKind.True;
+                }
+
+                var info = new SourceInfo(fields, nameKey, levelKey, noteKey, colorKey, levelRaw, featureId);
+                if (featureId == null)
+                {
+                    // 同一份文件里大多数要素的字段来源相同，共用一个对象
+                    if (sources.TryGetValue(info, out var shared)) info = shared;
+                    else sources[info] = info;
+                }
+                node.Source = info;
 
                 Dictionary<string, JsonNode?>? extra = null;
                 foreach (var kv in pr.EnumerateObject())
@@ -157,6 +254,11 @@ public static class GeoJsonIO
                     extra[kv.Name] = ToNode(kv.Value);
                 }
                 if (extra != null) node.Extra = extra;
+            }
+
+            else
+            {
+                node.Source = new SourceInfo(fields, FeatureId: featureId);
             }
 
             byId[id] = node;
@@ -180,7 +282,7 @@ public static class GeoJsonIO
         }
 
         if (badGeometry > 0) warnings.Add($"{badGeometry} 个要素的几何无法解析，已作为分组读入。");
-        return new ReadResult(roots, features.Count, linked, warnings, meta);
+        return new ReadResult(roots, features.Count, linked, warnings, meta, hasHierarchy);
     }
 
     private static string? TypeOf(JsonElement o)
@@ -385,19 +487,23 @@ public static class GeoJsonIO
     };
 
     /// <summary>写成 FeatureCollection 字符串，每个要素一行，上级在前。</summary>
-    public static string Write(IEnumerable<GeoNode> roots, JsonObject? meta = null)
+    public static string Write(IEnumerable<GeoNode> roots, JsonObject? meta = null, bool hierarchy = true)
     {
         using var ms = new MemoryStream();
-        WriteTo(ms, roots, meta);
+        WriteTo(ms, roots, meta, hierarchy);
         return Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Length);
     }
 
-    public static void WriteFile(string path, IEnumerable<GeoNode> roots)
+    /// <param name="hierarchy">
+    /// true：写成本程序的层级格式（每个要素带 id、parentId、name 等）；
+    /// false：保持原有字段，只写回源文件里本来就有的字段（和程序里新填的名称、颜色等），不加层级字段。
+    /// </param>
+    public static void WriteFile(string path, IEnumerable<GeoNode> roots, bool hierarchy = true)
     {
         var temp = path + ".tmp";
         using (var fs = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
         {
-            WriteTo(fs, roots);
+            WriteTo(fs, roots, null, hierarchy);
         }
         File.Move(temp, path, overwrite: true);
     }
@@ -406,7 +512,7 @@ public static class GeoJsonIO
     /// 流式写出：每个要素用同一个缓冲区单独序列化后写进流，要素之间换行，便于阅读和版本比较。
     /// 只有上级也在输出范围内时才写 parentId。
     /// </summary>
-    public static void WriteTo(Stream stream, IEnumerable<GeoNode> roots, JsonObject? meta = null)
+    public static void WriteTo(Stream stream, IEnumerable<GeoNode> roots, JsonObject? meta = null, bool hierarchy = true)
     {
         var rootList = roots.ToList();
         var included = new HashSet<GeoNode>(rootList.SelectMany(r => r.SelfAndDescendants()), ReferenceEqualityComparer.Instance);
@@ -433,7 +539,9 @@ public static class GeoJsonIO
                 first = false;
                 buffer.ResetWrittenCount();
                 w.Reset(buffer);
-                WriteFeature(w, n, n.Parent != null && included.Contains(n.Parent) ? n.Parent.Id : null);
+                var parentId = n.Parent != null && included.Contains(n.Parent) ? n.Parent.Id : null;
+                if (hierarchy) WriteFeature(w, n, parentId);
+                else WriteOriginalFeature(w, n, parentId);
                 w.Flush();
                 stream.Write(buffer.WrittenSpan);
             }
@@ -467,6 +575,79 @@ public static class GeoJsonIO
         WriteGeometry(w, n.Geometry);
         w.WriteEndObject();
     }
+
+    /// <summary>
+    /// 保持原有字段写出：只写源文件里本来就有的字段，名称、级别等改过的写回它们原来所在的字段，
+    /// 不添加 id、parentId（源文件本来就有的除外）。程序里新建的要素写名称、级别等非空的字段。
+    /// </summary>
+    private static void WriteOriginalFeature(Utf8JsonWriter w, GeoNode n, string? parentId)
+    {
+        var src = n.Source;
+        var fields = src?.Fields ?? SourceFields.None;
+        w.WriteStartObject();
+        w.WriteString("type", "Feature");
+        if (src?.FeatureId is { } fid)
+        {
+            w.WritePropertyName("id");
+            fid.WriteTo(w);
+        }
+        w.WritePropertyName("properties");
+        w.WriteStartObject();
+        if ((fields & SourceFields.Id) != 0) w.WriteString("id", n.Id);
+        if ((fields & SourceFields.ParentId) != 0 && parentId != null) w.WriteString("parentId", parentId);
+
+        // 改过的值写回原来所在的字段（在下面写 Extra 时替换）
+        string? nameOverride = null, levelOverride = null, noteOverride = null;
+        if ((fields & SourceFields.Name) != 0) w.WriteString("name", n.Name);
+        else if (src?.NameKey is { } nk) nameOverride = ExtraText(n, nk) == n.Name ? null : n.Name;
+        else if (n.Name.Length > 0) w.WriteString("name", n.Name);
+
+        if ((fields & SourceFields.Level) != 0)
+        {
+            w.WriteString("level", src!.LevelRaw != null && MapLevel(src.LevelRaw) == n.Level ? src.LevelRaw : n.Level);
+        }
+        else if (src?.LevelKey is { } lk) levelOverride = ExtraText(n, lk) == n.Level ? null : n.Level;
+        else if (n.Level.Length > 0) w.WriteString("level", n.Level);
+
+        if ((fields & SourceFields.Note) != 0) w.WriteString("note", n.Note);
+        else if (src?.NoteKey is { } ok) noteOverride = ExtraText(n, ok) == n.Note ? null : n.Note;
+        else if (n.Note.Length > 0) w.WriteString("note", n.Note);
+
+        if ((fields & SourceFields.Color) != 0 || (src?.ColorKey == null && n.Color != null))
+        {
+            if (n.Color != null) w.WriteString("color", n.Color);
+        }
+        if ((fields & SourceFields.Icon) != 0 || (n.Kind == NodeKind.Point && n.Icon != MarkerIcon.Pin))
+        {
+            w.WriteString("icon", n.Icon.ToString().ToLowerInvariant());
+        }
+        if ((fields & SourceFields.Hidden) != 0 || !n.Visible) w.WriteBoolean("hidden", !n.Visible);
+
+        foreach (var kv in n.Extra)
+        {
+            string? replace = null;
+            if (kv.Key == src?.NameKey) replace = nameOverride;
+            else if (kv.Key == src?.LevelKey) replace = levelOverride;
+            else if (kv.Key == src?.NoteKey) replace = noteOverride;
+            else if (kv.Key == src?.ColorKey)
+            {
+                // 颜色改成自动时去掉原来的颜色字段；改过颜色时写回原字段
+                if (n.Color == null) continue;
+                if (NormalizeColor(ExtraText(n, kv.Key)) != n.Color) replace = n.Color;
+            }
+            w.WritePropertyName(kv.Key);
+            if (replace != null) w.WriteStringValue(replace);
+            else if (kv.Value is null) w.WriteNullValue();
+            else kv.Value.WriteTo(w);
+        }
+        w.WriteEndObject();
+        w.WritePropertyName("geometry");
+        WriteGeometry(w, n.Geometry);
+        w.WriteEndObject();
+    }
+
+    private static string? ExtraText(GeoNode n, string key)
+        => n.Extra.TryGetValue(key, out var v) && v is JsonValue value && value.TryGetValue<string>(out var text) ? text : v?.ToJsonString();
 
     private static void WriteGeometry(Utf8JsonWriter w, Geometry? g)
     {

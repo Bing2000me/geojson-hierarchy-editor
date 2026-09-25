@@ -56,6 +56,16 @@ public sealed class GeoDocument
 
     public string? FilePath { get; set; }
 
+    /// <summary>
+    /// 保存时是否把层级写进要素属性（id、parentId）。新建的文档和本来就带 parentId 的文件为 true；
+    /// 打开的是没有层级字段的文件时为 false：识别出的上下级关系只保存在程序里，保存时保持原有字段，
+    /// 用户选择“写入层级信息”或“导出并保留层级信息”时才写入。
+    /// </summary>
+    public bool WritesHierarchy { get; set; } = true;
+
+    /// <summary>用户已经确认过“只保存原有字段”（同一个文档不再询问）。</summary>
+    public bool PlainSaveConfirmed { get; set; }
+
     public string DisplayName => FilePath is null ? "未命名" : Path.GetFileNameWithoutExtension(FilePath);
 
     public bool IsDirty => CurrentState != _savedState;
@@ -266,6 +276,32 @@ public sealed class GeoDocument
         Touch(ChangeKind.Structure);
     }
 
+    /// <summary>
+    /// 按给定的上级重新组织整棵树（自动识别层级后应用）。没有列出的节点保持原来的上级；
+    /// 同一上级下的顺序保持原来的先后。调用方保证不会形成循环。
+    /// </summary>
+    public void Restructure(IReadOnlyDictionary<GeoNode, GeoNode?> parents)
+    {
+        RequireEdit();
+        var order = AllNodes().ToList();
+        var newParent = new Dictionary<GeoNode, GeoNode?>(order.Count, ReferenceEqualityComparer.Instance);
+        foreach (var n in order)
+        {
+            var p = parents.TryGetValue(n, out var chosen) ? chosen : n.Parent;
+            if (p != null && !ReferenceEquals(Find(p.Id), p)) p = null;
+            newParent[n] = p;
+        }
+        _roots.Clear();
+        foreach (var n in order) n.ChildList.Clear();
+        foreach (var n in order)
+        {
+            var p = newParent[n];
+            n.Parent = p;
+            (p?.ChildList ?? _roots).Add(n);
+        }
+        Touch(ChangeKind.Structure);
+    }
+
     public void SetGeometry(GeoNode node, Geometry? geometry)
     {
         RequireEdit();
@@ -398,8 +434,10 @@ public sealed class GeoDocument
     }
 
     /// <summary>用一棵新树替换整个文档，清空撤销历史。</summary>
-    public void Load(IEnumerable<GeoNode> roots, string? filePath)
+    public void Load(IEnumerable<GeoNode> roots, string? filePath, bool writesHierarchy = true)
     {
+        WritesHierarchy = writesHierarchy;
+        PlainSaveConfirmed = false;
         _roots.Clear();
         _byId.Clear();
         _selectionSet = null;
@@ -441,7 +479,8 @@ public sealed class GeoDocument
         MarkerIcon Icon,
         bool Visible,
         Geometry? Geometry,
-        IReadOnlyDictionary<string, JsonNode?> Extra);
+        IReadOnlyDictionary<string, JsonNode?> Extra,
+        SourceInfo? Source);
 
     private sealed record Snapshot(List<NodeState> Nodes, List<string> SelectedIds);
 
@@ -457,12 +496,12 @@ public sealed class GeoDocument
             if (n.UndoState is NodeState s
                 && s.Id == n.Id && s.ParentId == parentId && s.Name == n.Name && s.Level == n.Level && s.Note == n.Note
                 && s.Color == n.Color && s.Icon == n.Icon && s.Visible == n.Visible
-                && ReferenceEquals(s.Geometry, n.Geometry) && ReferenceEquals(s.Extra, n.Extra))
+                && ReferenceEquals(s.Geometry, n.Geometry) && ReferenceEquals(s.Extra, n.Extra) && ReferenceEquals(s.Source, n.Source))
             {
                 nodes.Add(s);
                 continue;
             }
-            s = new NodeState(n.Id, parentId, n.Name, n.Level, n.Note, n.Color, n.Icon, n.Visible, n.Geometry, n.Extra);
+            s = new NodeState(n.Id, parentId, n.Name, n.Level, n.Note, n.Color, n.Icon, n.Visible, n.Geometry, n.Extra, n.Source);
             n.UndoState = s;
             nodes.Add(s);
         }
@@ -488,6 +527,7 @@ public sealed class GeoDocument
             node.Visible = s.Visible;
             node.Geometry = s.Geometry;
             node.Extra = s.Extra;
+            node.Source = s.Source;
             node.UndoState = s;
             var parent = s.ParentId != null && _byId.TryGetValue(s.ParentId, out var p) ? p : null;
             node.Parent = parent;

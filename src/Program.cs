@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using Aprillz.MewUI;
 using Aprillz.MewUI.Skia.Interop;
 
+using GeoJsonEditor.App;
 using GeoJsonEditor.Ui;
 
 namespace GeoJsonEditor;
@@ -21,6 +22,10 @@ internal static class Program
         };
 
         Localization.ApplyChinese();
+
+        // 上次自动更新留下的旧文件在后台清理；有下载好的新版本时，程序退出后替换（ProcessExit 兜底，例如从菜单退出）
+        _ = Task.Run(UpdateService.Cleanup);
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => UpdateService.ApplyPending();
 
         var settings = AppSettings.Load();
         Application
@@ -57,6 +62,8 @@ internal static class Program
             .WithShutdownMode(ShutdownMode.OnLastWindowClose)
             .BuildMainWindow(() => new MainWindow(settings, args))
             .Run();
+
+        UpdateService.ApplyPending();
     }
 
     /// <summary>

@@ -18,6 +18,13 @@
 3. 分级简化，优化大数据下的性能。
 4. 其他必要的界面、性能优化和功能改进；打好 Windows 和 macOS 包；发布到用户 GitHub（公开仓库 + Release）。
 
+第三轮（1.2.0）新增的要求：
+
+1. 地名和城市标志：点多时在小比例尺下堆在一起，参考成熟地图软件做逐级展开（做成了点聚合 + 按重要度放置标注）。
+2. 顶点编辑改为二级操作：选中只显示轮廓，双击 / 回车 / 按钮才显示顶点手柄。
+3. 从 GitHub 获取新版本并自动更新。
+4. 导入 GeoJSON 时可以选择自动识别上下级关系（属性字段 + 空间包含），先预览（各级数量、已确认 / 待确认 / 冲突），能逐个改待确认的；识别结果只存在程序内部，用户选“导出并保留层级信息”（或保存时选“写入层级信息”）才写进 properties。
+
 ## 硬性约束
 
 - UI 框架：MewUI 0.21.1（NuGet `Aprillz.MewUI` + `Aprillz.MewUI.Skia.All`）。
@@ -25,15 +32,17 @@
 - 地图画布：Skia（`SkiaCanvasView` 的子类 `Map/MapCanvas`）。
 - 几何运算：NetTopologySuite 2.6.0（含 `Coverage` 命名空间）。
 
-## 当前状态（2026-09-25，1.1.0）
+## 当前状态（2026-09-25，1.2.0）
 
 | 内容 | 状态 |
 |---|---|
 | 编译 | 通过，无警告 |
-| 核心逻辑 | `dotnet run --project tests/LogicTests`：读写、剪贴板（同文档 / 跨文档 / 纠偏 / WKT / 坐标）、切割合并、撤销、分级简化与 DP 一致、拓扑简化后层级检查无问题、大数据性能，全部通过 |
-| macOS 运行 | 打包后的 .app 在本机跑过；用 computer-use 的后台窗口工具点过：选择、逐级选择、简化边界对话框、撤销、⌘⇧N 新建窗口、滚轮缩放、拖动平移、161 万顶点大文件 |
-| 没法在后台验证的 | 下拉菜单、右键菜单（MewUI 在 macOS 上用独立的弹出窗口，应用不在前台时打不开）；⌘C / ⌘V 被 computer-use 工具拦截，剪贴板只由测试程序覆盖 |
-| Windows | `scripts/publish.sh win` 在 macOS 上交叉打包；双击问题用的是上游修复，**没在 Windows 真机上验证过** |
+| 核心逻辑 | `dotnet run --project tests/LogicTests`：原有各项，加上点聚合索引的不变量、自动识别层级（示例数据按属性 / 按空间都还原出原层级；本机有北宋数据时跑一遍，路 24 / 州 330 / 县 1,287）、两种保存方式、更新包的版本解析和文件替换，全部通过 |
+| macOS 运行 | 用后台窗口看过：打开北宋合并数据时的识别对话框和预览、点聚合和单击展开、选中不显示顶点、双击进入顶点编辑 |
+| 没实机验证的 | 真正从 GitHub 下载安装新版本（要等下一个版本发布后才能走完整流程；文件替换逻辑由测试程序覆盖）；Windows 上的一切 |
+| Windows | `scripts/publish.sh win` 在 macOS 上交叉打包，**没在 Windows 真机上验证过** |
+
+测试数据：`/Users/air/Downloads/Geojson/data/processed/1102_song`（北宋，字段是 feature_id / parent_id / name_zh / admin_type，分成 admin、settlements、physical 几个文件；另有 0742_tang）。`dotnet run --project tests/LogicTests -- detect 文件...` 把几个文件当一个文档识别层级并打印结果。
 
 ## 本机环境
 
@@ -60,3 +69,9 @@ export DOTNET_ROOT=$HOME/.dotnet PATH=$HOME/.dotnet:$PATH
 - 高德瓦片带注记的只有 256px 版本（`scl=2` 的高清瓦片没有注记）。CARTO 现在要 API key，已去掉。
 - MewUI 内置控件的文字在 `Ui/Localization.cs` 里统一换成中文。
 - MewUI 的 `TextBlock` 换行：一段中文里有空格时会优先在空格处断行，数字前后带空格的长句换行会很难看，需要换行的长段落尽量不要夹带空格。
+- MewUI 的 `CheckBox`、`Button` 文字里的下划线是快捷键标记，会被吃掉（“parent_id”显示成“parentid”），这类文字里不要写下划线。
+- 点标记：`Map/PointClusters.cs` 是聚合索引，`MapCanvas.Points.cs` 画点和簇并记下画出来的标记，命中测试只认画出来的（收进簇里的点点不中）。选中的点不参与聚合，总是单独画在最上层。文档一改（`_docStamp`）就重建索引，两万个点以上在后台建。
+- 顶点编辑状态是 `Editor.VertexEditTarget`，选择变了、换工具、要素被删或隐藏时自动退出。只是选中时不显示手柄。
+- 自动识别层级：`Geo/HierarchyDetector.cs` 只读节点、可在后台线程跑；`HierarchyDetection.Rebuild` 把还没进文档的节点组织成树，`GeoDocument.Restructure` 在文档里整体改上级（一步撤销）。
+- 保存方式：`GeoDocument.WritesHierarchy` 为 false（原文件没有 parentId）时按原有字段写（`GeoJsonIO` 的 hierarchy: false），节点上的 `SourceInfo` 记着原来有哪些字段、名称取自哪个字段。`SourceInfo` 在撤销快照里，删除再撤销不会丢。
+- 自动更新：`App/UpdateService.cs`。替换在程序退出后做（`Program.Main` 在 `Run` 返回后和 `ProcessExit` 里各调一次 `ApplyPending`），仓库名写在 `UpdateService.Repository`。发布时附件名必须是 `GeoJsonEditor-<版本>-win-x64.zip` 和 `GeoJsonEditor-<版本>-macos-arm64.zip`，否则程序找不到安装包；tag 用 `v<版本>`。

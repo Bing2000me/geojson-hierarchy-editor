@@ -59,6 +59,9 @@ public static class Icons
     public const string Edit = "M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7 M18.4 2.6a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4z";
     public const string Copy = "M10 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2";
     public const string Simplify = "M3 16 7.5 7l3.5 6 3-4 3 5 4-7 M3 21h18";
+    public const string EditVertices = "M3.5 3.5h4v4h-4z M16.5 3.5h4v4h-4z M16.5 16.5h4v4h-4z M3.5 16.5h4v4h-4z M7.5 5.5h9 M18.5 7.5v9 M7.5 18.5h9 M5.5 7.5v9";
+    public const string Cluster = "M8.5 12a3.5 3.5 0 1 0 7 0a3.5 3.5 0 1 0-7 0 M3 5a2 2 0 1 0 4 0a2 2 0 1 0-4 0 M17 5a2 2 0 1 0 4 0a2 2 0 1 0-4 0 M17 19a2 2 0 1 0 4 0a2 2 0 1 0-4 0 M3 19a2 2 0 1 0 4 0a2 2 0 1 0-4 0";
+    public const string Update = "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0 M12 7.5v8 M8.5 12.5l3.5 3.5 3.5-3.5";
     public const string Crosshair = "M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0 M12 2v4 M12 18v4 M2 12h4 M18 12h4";
 
     // ── 实心形状（点标记图标选择器、树节点类别色块） ──

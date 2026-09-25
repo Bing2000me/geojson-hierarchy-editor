@@ -29,6 +29,8 @@ public sealed partial class MainWindow
     private readonly Command _cmdSave = new("file.save", "保存");
     private readonly Command _cmdSaveAs = new("file.saveAs", "另存为…");
     private readonly Command _cmdExport = new("file.export", "导出所选（含下级）…");
+    private readonly Command _cmdExportHierarchy = new("file.exportHierarchy", "导出并保留层级信息…");
+    private readonly Command _cmdDetectHierarchy = new("edit.detectHierarchy", "识别层级结构…");
     private readonly Command _cmdUndo = new("edit.undo", "撤销");
     private readonly Command _cmdRedo = new("edit.redo", "重做");
     private readonly Command _cmdNewGroup = new("edit.newGroup", "新建分组");
@@ -45,6 +47,10 @@ public sealed partial class MainWindow
     private readonly Command _cmdDuplicate = new("edit.duplicate", "创建副本");
     private readonly Command _cmdCopyCoordinate = new("edit.copyCoordinate", "复制此处坐标");
     private readonly Command _cmdSimplify = new("edit.simplify", "简化边界…");
+    private readonly Command _cmdEditVertices = new("edit.vertices", "编辑顶点");
+    private readonly Command _cmdCheckUpdate = new("app.checkUpdate", "检查更新…");
+    private readonly ObservableValue<bool> _updateAvailable = new(false);
+    private readonly ObservableValue<string> _updateText = new("");
 
     // ───────────────────────── 整体布局 ─────────────────────────
 
@@ -123,7 +129,10 @@ public sealed partial class MainWindow
             .Item(_cmdSaveAs)
             .Separator()
             .Item(_cmdImport)
-            .Item(_cmdExport);
+            .Item(_cmdExportHierarchy)
+            .Item(_cmdExport)
+            .Separator()
+            .Item(_cmdCheckUpdate);
 
         var editMenu = new Menu()
             .Item(_cmdUndo)
@@ -136,7 +145,9 @@ public sealed partial class MainWindow
             .Separator()
             .Item("全选同级", StandardCommands.SelectAll)
             .Item(_cmdNewGroup)
+            .Item(_cmdDetectHierarchy)
             .Separator()
+            .Item(_cmdEditVertices)
             .Item(_cmdMerge)
             .Item(_cmdSimplify)
             .Item(_cmdRebuild)
@@ -172,7 +183,7 @@ public sealed partial class MainWindow
             title.Margin(6, 0, 10, 0),
             fileButton,
             editButton,
-            IconButton(Icons.Save, "保存（⌘/Ctrl+S）", () => SaveDocument(saveAs: false)),
+            IconButton(Icons.Save, "保存（⌘/Ctrl+S）", () => _ = SaveDocumentAsync(saveAs: false)),
             VDivider(),
             undo,
             redo);
@@ -186,7 +197,7 @@ public sealed partial class MainWindow
                 b.Background(t.IsDark ? Color.FromRgb(0x14, 0x16, 0x1A) : Color.FromRgb(0xEC, 0xEE, 0xF2));
             })
             .Child(new StackPanel().Horizontal().Spacing(2).Children(
-                ToolButton(EditTool.Select, Icons.Select, "选择", "V", "选择要素、编辑顶点、平移地图"),
+                ToolButton(EditTool.Select, Icons.Select, "选择", "V", "选择要素、平移地图；双击要素编辑顶点"),
                 ToolButton(EditTool.DrawPoint, Icons.Point, "点", "P", "放置点标记"),
                 ToolButton(EditTool.DrawLine, Icons.Line, "线", "L", "绘制线"),
                 ToolButton(EditTool.DrawPolygon, Icons.Polygon, "面", "A", "绘制面（区域）"),
@@ -219,6 +230,13 @@ public sealed partial class MainWindow
             .ToolTip("显示 / 隐藏地图标注")
             .BindIsChecked(_editor.ShowLabels);
 
+        var cluster = new ToggleButton()
+            .StyleName(AppStyles.Tool)
+            .Padding(7)
+            .Content(new IconView(Icons.Cluster, 18))
+            .ToolTip("点聚合：点多时缩小地图，相邻的点合成一个带数量的圆，放大后逐级展开")
+            .BindIsChecked(_editor.ClusterPoints);
+
         var themeIcon = new IconView(Icons.Moon, 18);
         var themeButton = new Button().StyleName(AppStyles.IconButton).Padding(6).Content(themeIcon).ToolTip("切换深色 / 浅色界面");
         themeButton.Click += ToggleTheme;
@@ -226,8 +244,10 @@ public sealed partial class MainWindow
         Loaded += () => themeIcon.Data = Theme.IsDark ? Icons.Sun : Icons.Moon;
 
         var right = new StackPanel().Horizontal().Spacing(4).CenterVertical().Right().Children(
+            BuildUpdateBadge(),
             baseMapButton,
             labels,
+            cluster,
             themeButton,
             IconButton(Icons.Keyboard, "快捷键与操作说明", ShowShortcuts));
 
@@ -245,6 +265,50 @@ public sealed partial class MainWindow
                 b.BorderBrush(UiColors.Divider(t));
             })
             .Child(grid);
+    }
+
+    /// <summary>右上角的“新版本”提示：检查到新版本时出现，点开是更新对话框。</summary>
+    private FrameworkElement BuildUpdateBadge()
+    {
+        var badge = new Button()
+            .StyleName(AppStyles.Ghost)
+            .Padding(9, 4)
+            .Content(new StackPanel().Horizontal().Spacing(6).Children(
+                new IconView(Icons.Update, 15).CenterVertical().WithTheme((t, i) => i.Tint = t.Palette.Accent),
+                new TextBlock().BindText(_updateText).CenterVertical().WithTheme((t, tb) => tb.Foreground = t.Palette.Accent)))
+            .ToolTip("有新版本，点击查看更新内容并安装")
+            .OnClick(() => ShowUpdateDialog(UpdateService.Available))
+            .CenterVertical();
+        badge.BindIsVisible(_updateAvailable);
+
+        void Sync()
+        {
+            var available = UpdateService.Available;
+            _updateAvailable.Value = available != null;
+            _updateText.Value = available == null ? "" : $"新版本 {available.Version}";
+        }
+        UpdateService.AvailableChanged += Sync;
+        Closed += () => UpdateService.AvailableChanged -= Sync;
+        Sync();
+        return badge;
+    }
+
+    private async void ShowUpdateDialog(UpdateInfo? info)
+    {
+        if (_busy) return;
+        await UpdateDialog.ShowAsync(this, _settings, info, PrepareRestartAsync);
+    }
+
+    /// <summary>重启安装更新前：逐个窗口处理未保存的修改，全部同意后关闭所有窗口（程序随之退出，再替换文件）。</summary>
+    private static async Task<bool> PrepareRestartAsync()
+    {
+        var windows = Application.Current.AllWindows.OfType<MainWindow>().ToList();
+        foreach (var w in windows)
+        {
+            if (!await w.ConfirmCloseAsync()) return false;
+        }
+        foreach (var w in windows) w.Close();
+        return true;
     }
 
     private ClickToggle ToolButton(EditTool tool, string icon, string label, string key, string description)
@@ -347,6 +411,10 @@ public sealed partial class MainWindow
         {
             if (_editor.Tool.Value == EditTool.Select) RebuildToolOptions();
         };
+        _editor.VertexEditTarget.Changed += () =>
+        {
+            if (_editor.Tool.Value == EditTool.Select) RebuildToolOptions();
+        };
         SyncToolButtons();
         RebuildToolOptions();
 
@@ -417,20 +485,51 @@ public sealed partial class MainWindow
         var tool = _editor.Tool.Value;
         if (tool == EditTool.Select)
         {
-            var sel = _editor.Doc.Selection;
-            if (sel.Count == 1 && sel[0].Kind is NodeKind.Polygon or NodeKind.Line && sel[0].IsEffectivelyVisible)
+            if (_editor.VertexEditTarget.Value is { } editing)
             {
+                // 顶点编辑中：选项、操作说明和“完成”
                 ShowToolOptions(new StackPanel().Horizontal().Spacing(10).Children(
                     new StackPanel().Horizontal().Spacing(7).CenterVertical().Children(
-                        new IconView(Icons.Select, 16).CenterVertical().WithTheme((t, i) => i.Tint = t.Palette.Accent),
-                        new TextBlock().Text("编辑顶点").SemiBold().CenterVertical()),
+                        new IconView(Icons.EditVertices, 16).CenterVertical().WithTheme((t, i) => i.Tint = t.Palette.Accent),
+                        new TextBlock().Text("编辑顶点").SemiBold().CenterVertical(),
+                        new TextBlock().Text(editing.DisplayName).MaxWidth(160).TextTrimming(TextTrimming.CharacterEllipsis).CenterVertical()
+                            .WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t))),
                     VDivider(),
                     new CheckBox().Content("吸附").BindIsChecked(_editor.Snapping).CenterVertical().ToolTip("拖动顶点时对齐到附近的顶点和边"),
                     new CheckBox().Content("联动相邻边界").BindIsChecked(_editor.LinkedEditing).CenterVertical()
                         .ToolTip("移动公共边界上的顶点时，相邻区域和上级区域的同一个顶点一起移动，边界保持重合"),
                     VDivider(),
                     new TextBlock().Text("拖动方块移动 · 拖动边中点插入 · 右键删除").FontSize(12).CenterVertical()
-                        .WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t))));
+                        .WithTheme((t, tb) => tb.Foreground = UiColors.Subtle(t)),
+                    VDivider(),
+                    new Button()
+                        .StyleName(AppStyles.Primary)
+                        .Padding(12, 4)
+                        .Content("完成")
+                        .ToolTip("也可以按回车或 Esc")
+                        .OnClick(() =>
+                        {
+                            _editor.EndVertexEdit();
+                            _map.Focus();
+                        })
+                        .CenterVertical()));
+            }
+            else if (_editor.VertexEditCandidate != null)
+            {
+                // 只是选中：地图上不显示顶点，这里给一个不打扰的入口
+                ShowToolOptions(new Button()
+                    .StyleName(AppStyles.Ghost)
+                    .Padding(10, 4)
+                    .Content(new StackPanel().Horizontal().Spacing(7).Children(
+                        new IconView(Icons.EditVertices, 15).CenterVertical().WithTheme((t, i) => i.Tint = t.Palette.Accent),
+                        new TextBlock().Text("编辑顶点").CenterVertical(),
+                        new TextBlock().Text("双击 / 回车").FontSize(11.5).CenterVertical().WithTheme((t, tb) => tb.Foreground = UiColors.Faint(t))))
+                    .ToolTip("进入顶点编辑：拖动顶点修改形状、插入或删除顶点")
+                    .OnClick(() =>
+                    {
+                        _editor.BeginVertexEdit();
+                        _map.Focus();
+                    }), compact: true);
             }
             else
             {
@@ -515,7 +614,7 @@ public sealed partial class MainWindow
         ShowToolOptions(row);
     }
 
-    private void ShowToolOptions(UIElement content)
+    private void ShowToolOptions(UIElement content, bool compact = false)
     {
         _toolOptionsHost.Child = new ShadowDecorator()
             .BlurRadius(18)
@@ -524,7 +623,7 @@ public sealed partial class MainWindow
             .ShadowColor(Color.FromArgb(46, 15, 23, 42))
             .Child(new Border()
                 .CornerRadius(12)
-                .Padding(12, 7)
+                .Padding(compact ? new Thickness(3) : new Thickness(12, 7))
                 .BorderThickness(1)
                 .WithTheme((t, b) =>
                 {
@@ -648,6 +747,7 @@ public sealed partial class MainWindow
         => new ContextMenu()
             .Item(_cmdZoomSel)
             .Item(_cmdRename)
+            .Item(_cmdEditVertices)
             .Separator()
             .Item("剪切", StandardCommands.Cut)
             .Item("复制", StandardCommands.Copy)
@@ -675,6 +775,7 @@ public sealed partial class MainWindow
             .Item("粘贴", StandardCommands.Paste)
             .Item(_cmdDuplicate)
             .Separator()
+            .Item(_cmdEditVertices)
             .Item(_cmdMerge)
             .Item(_cmdSimplify)
             .Item(_cmdRebuild)
@@ -705,9 +806,11 @@ public sealed partial class MainWindow
             if (!_busy && await ConfirmDiscardAsync()) await OpenPathAsync(path);
         });
         Commands.Register(_cmdImport, ImportDocument);
-        Commands.Register(_cmdSave, () => SaveDocument(saveAs: false));
-        Commands.Register(_cmdSaveAs, () => SaveDocument(saveAs: true));
+        Commands.Register(_cmdSave, () => _ = SaveDocumentAsync(saveAs: false));
+        Commands.Register(_cmdSaveAs, () => _ = SaveDocumentAsync(saveAs: true));
         Commands.Register(_cmdExport, ExportSelection, HasSel);
+        Commands.Register(_cmdExportHierarchy, ExportWithHierarchy, () => _editor.Doc.Count > 0);
+        Commands.Register(_cmdDetectHierarchy, DetectHierarchy, () => _editor.Doc.Count >= 2);
         Commands.Register(_cmdUndo, () => _editor.Doc.Undo(), () => _editor.Doc.CanUndo);
         Commands.Register(_cmdRedo, () => _editor.Doc.Redo(), () => _editor.Doc.CanRedo);
         Commands.Register(_cmdNewGroup, () => _editor.NewGroup(Editor.SuggestDrawTarget(_editor.Doc.Primary)));
@@ -734,6 +837,12 @@ public sealed partial class MainWindow
         Commands.Register(_cmdDuplicate, () => _editor.Duplicate(), HasSel);
         Commands.Register(_cmdCopyCoordinate, () => CopyCoordinate(_map.DataAt(_contextPoint)));
         Commands.Register(_cmdSimplify, ShowSimplifyDialog, () => _editor.Doc.Count > 0);
+        Commands.Register(_cmdCheckUpdate, () => ShowUpdateDialog(null));
+        Commands.Register(_cmdEditVertices, () =>
+        {
+            _editor.BeginVertexEdit();
+            _map.Focus();
+        }, () => _editor.VertexEditCandidate != null);
 
         InputMap.Map(_cmdNew, new KeyGesture(Key.N, primary));
         InputMap.Map(_cmdNewWindow, new KeyGesture(Key.N, primary | ModifierKeys.Shift));
@@ -778,13 +887,23 @@ public sealed partial class MainWindow
             ("编辑", [
                 ("Shift/⌘/Ctrl 单击", "多选"),
                 ("M", "合并所选的面或线"),
-                ("拖动白色方块", "移动顶点（相邻区域的公共边界会联动）"),
-                ("拖动边中点", "插入顶点"),
-                ("右键 / 双击顶点", "删除顶点"),
                 ("Delete", "删除所选"),
                 ("H", "显示 / 隐藏所选"),
                 ("F2", "重命名"),
                 ("⌘/Ctrl+Z，⌘/Ctrl+Shift+Z", "撤销，重做"),
+            ]),
+            ("顶点编辑", [
+                ("双击要素 / 回车", "进入顶点编辑（只是选中时不显示顶点）"),
+                ("拖动白色方块", "移动顶点（相邻区域的公共边界会联动）"),
+                ("拖动边中点", "插入顶点"),
+                ("右键 / 双击顶点", "删除顶点；鼠标停在顶点上按 Delete 也可以"),
+                ("回车 / Esc", "完成顶点编辑"),
+            ]),
+            ("点标记", [
+                ("单击数字圆", "点多时相邻的点合成一个圆，单击放大展开"),
+                ("Shift/⌘/Ctrl 单击数字圆", "把这一簇点加入选择"),
+                ("右键数字圆", "选中这一簇点并弹出菜单"),
+                ("右上角聚合按钮", "开关点聚合"),
             ]),
             ("剪贴板", [
                 ("⌘/Ctrl+C", "复制所选要素（含下级），可粘贴到另一个窗口、另一个程序实例或其他 GIS 软件"),

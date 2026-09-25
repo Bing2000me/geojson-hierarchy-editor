@@ -16,6 +16,7 @@ public static class UiColors
     public static Color AccentSoft(Theme t) => t.Palette.Accent.WithAlpha(t.IsDark ? (byte)56 : (byte)30);
     public static Color Card(Theme t) => t.IsDark ? Color.FromRgb(0x27, 0x2A, 0x31) : Color.FromRgb(0xF7, 0xF8, 0xFA);
     public static Color Danger(Theme t) => t.IsDark ? Color.FromRgb(0xF8, 0x71, 0x71) : Color.FromRgb(0xDC, 0x26, 0x26);
+    public static Color Warning(Theme t) => t.IsDark ? Color.FromRgb(0xFB, 0xBF, 0x24) : Color.FromRgb(0xB4, 0x53, 0x09);
 }
 
 /// <summary>应用级样式表：工具按钮、图标按钮、标签按钮等。</summary>

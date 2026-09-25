@@ -34,6 +34,7 @@ public sealed class InspectorPanel
 
         _editor.Doc.SelectionChanged += Rebuild;
         _editor.Doc.Changed += OnDocumentChanged;
+        _editor.VertexEditTarget.Changed += SyncVertexButton;
         Rebuild();
     }
 
@@ -54,10 +55,28 @@ public sealed class InspectorPanel
         Rebuild();
     }
 
+    // “编辑顶点 / 完成编辑顶点”按钮：进出顶点编辑时只换这个按钮，不重建整个面板（滚动位置不变）
+    private Border? _vertexButtonHost;
+    private GeoNode? _vertexNode;
+
+    private void SyncVertexButton()
+    {
+        if (_vertexButtonHost == null || _vertexNode == null) return;
+        var node = _vertexNode;
+        bool editing = ReferenceEquals(_editor.VertexEditTarget.Value, node);
+        _vertexButtonHost.Child = (editing
+                ? ActionButton(Icons.Check, "完成编辑顶点（回车）", () => _editor.EndVertexEdit(), style: AppStyles.Primary)
+                : ActionButton(Icons.EditVertices, "编辑顶点（双击 / 回车）", () => _editor.BeginVertexEdit(node)))
+            .ToolTip("拖动顶点修改形状、在边中点插入顶点、右键删除顶点")
+            .StretchHorizontal();
+    }
+
     private void Rebuild()
     {
         var sel = _editor.Doc.Selection;
         _nameBox = null;
+        _vertexButtonHost = null;
+        _vertexNode = null;
         FrameworkElement content = sel.Count switch
         {
             0 => BuildOverview(),
@@ -220,6 +239,8 @@ public sealed class InspectorPanel
         (string Key, string Text)[] tips =
         [
             ("单击", "选择要素；再次单击同一处选中上一级"),
+            ("双击 / 回车", "编辑所选面或线的顶点"),
+            ("单击数字圆", "放大展开聚合在一起的点"),
             ("Shift/⌘ 单击", "多选，之后按 M 合并"),
             ("X", "切割：画线穿过要素后双击"),
             ("P / L / A", "画点 / 线 / 面"),
@@ -603,6 +624,13 @@ public sealed class InspectorPanel
     private FrameworkElement BuildActions(GeoNode node)
     {
         var list = new StackPanel().Vertical().Spacing(6);
+        if (_editor.CanEditVertices(node))
+        {
+            _vertexNode = node;
+            _vertexButtonHost = new Border();
+            SyncVertexButton();
+            list.Add(_vertexButtonHost);
+        }
         list.Add(ActionButton(Icons.Target, "定位到此要素（F）", () => _editor.RequestZoomTo(new[] { node })).StretchHorizontal());
         if (node.Kind is NodeKind.Polygon or NodeKind.Line || node.Descendants().Any(d => d.Kind is NodeKind.Polygon or NodeKind.Line))
         {

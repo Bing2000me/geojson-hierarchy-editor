@@ -1,8 +1,8 @@
 # GeoJSON 层级编辑器
 
-桌面端的 GeoJSON 编辑器，专门处理有上下级关系的区域数据（省 → 市 → 区县）。父子关系体现在几何上：切割、合并、编辑顶点、简化边界时，相邻区域之间、上下级之间的边界始终保持一致。支持点标记、在线底图、多窗口之间复制粘贴要素，上百万顶点的数据也能流畅浏览。Windows 和 macOS 都能用。
+桌面端的 GeoJSON 编辑器，专门处理有上下级关系的区域数据（省 → 市 → 区县）。父子关系体现在几何上：切割、合并、编辑顶点、简化边界时，相邻区域之间、上下级之间的边界始终保持一致。导入没有层级的数据时，可以按属性字段和空间包含关系自动识别上下级关系，预览、修改后再应用。点标记多时按缩放级别聚合，逐级展开。支持在线底图、多窗口之间复制粘贴要素，上百万顶点的数据也能流畅浏览，能从 GitHub 自动更新。Windows 和 macOS 都能用。
 
-A desktop editor for hierarchical GeoJSON (province → city → district). Split, merge, reshape and simplify boundaries while shared borders and parent/child outlines stay consistent. Copy and paste features between windows, point markers, online basemaps, level-of-detail rendering for million-vertex datasets. Built with [MewUI](https://github.com/aprillz/MewUI), SkiaSharp and NetTopologySuite; runs on Windows x64 and macOS (Apple Silicon).
+A desktop editor for hierarchical GeoJSON (province → city → district). Split, merge, reshape and simplify boundaries while shared borders and parent/child outlines stay consistent. Detect parent/child relations of flat data from attribute fields and spatial containment, with a review step. Point clustering that unfolds as you zoom, copy and paste between windows, online basemaps, level-of-detail rendering for million-vertex datasets, self-update from GitHub Releases. Built with [MewUI](https://github.com/aprillz/MewUI), SkiaSharp and NetTopologySuite; runs on Windows x64 and macOS (Apple Silicon).
 
 ![主界面](docs/images/main.jpg)
 
@@ -29,7 +29,10 @@ xattr -dr com.apple.quarantine "GeoJSON 层级编辑器.app"
 | 画面时自动整理 | “裁剪到上级”去掉超出上级的部分，“避让同级”扣掉与已有同级区域重叠的部分，相邻区域正好共用边界 |
 | 切割 | X，画一条完整穿过区域的线，双击执行，画线时实时预览切出的各块。**替换原区域**：下级跟着切开，按位置分到各块；**划分为下级**：原区域保留，切出的块成为它的下级，用来逐级细分 |
 | 合并 | 多选几个面（或几条线）后按 M。第一个选中的保留名称和属性，其余的下级都挂到合并结果下 |
-| 顶点编辑 | 选中一个面或线：拖动白色方块移动顶点，拖动边中点插入顶点，右键或双击顶点删除。“联动相邻边界”打开时，相邻区域和上级的同一个顶点一起移动。顶点很密的边界放大后才显示手柄，只处理视野内的顶点，几十万顶点的边界也能局部编辑 |
+| 顶点编辑 | 只是选中时地图上只显示轮廓。双击面或线（或选中后按回车、点地图上方的“编辑顶点”）进入顶点编辑：拖动白色方块移动顶点，拖动边中点插入顶点，右键或双击顶点删除，回车或 Esc 完成。“联动相邻边界”打开时，相邻区域和上级的同一个顶点一起移动。顶点很密的边界放大后才显示手柄，只处理视野内的顶点，几十万顶点的边界也能局部编辑 |
+| 点聚合 | 点多时（例如几千个治所、城镇），缩小地图后相邻的点合成一个带数量的圆，外圈按成员的颜色比例分段；放大后逐级展开。每个圆放在其中最重要的点（按级别、人口）的真实位置上，并标出它的名称。单击圆放大展开，Shift 或 ⌘/Ctrl 单击把这一簇点加入选择，右键选中它们并弹出菜单。右上角的按钮可以关掉 |
+| 标注 | 按重要度依次放置，放不下的不画：选中要素 → 上两级区域 → 点（按级别、人口，每个试右、左、上、下四个位置）→ 更深的区域 → 线。都城、省级的点名字号更大 |
+| 自动识别层级 | 打开或导入没有层级字段的文件时询问是否识别；也可以随时用“编辑 → 识别层级结构”。依据属性字段（自动找出 parent_id、pid、上级编码这类指向其他要素的字段，以及行政区划代码的前缀）和空间包含关系（要素有多大比例落在某个面里）。先显示识别结果：各层级的数量、已确认 / 待确认 / 有冲突的关系数，待确认和有冲突的要素可以逐个改选上级。识别结果只进程序内部的层级树，不改动原始文件 |
 | 复制粘贴 | ⌘/Ctrl+C、X、V。要素连同全部下级、属性和样式一起复制，可以粘贴到另一个窗口、另一个程序实例，也能粘贴到 geojson.io、QGIS 这类软件里。反过来，其他软件复制的 GeoJSON、WKT 或“经度, 纬度”文本也能直接粘贴进来。两边的数据坐标系不同时自动纠偏。选中面或分组时粘贴为它的下级 |
 | 创建副本、全选同级 | ⌘/Ctrl+D 在原位置创建副本（连同下级）；⌘/Ctrl+A 选中与当前要素同一上级的全部要素 |
 | 多窗口 | 文件 → 新建窗口（⌘/Ctrl+Shift+N）、在新窗口中打开，同时编辑几张地图，窗口之间复制粘贴 |
@@ -40,7 +43,8 @@ xattr -dr com.apple.quarantine "GeoJSON 层级编辑器.app"
 | 由下级生成边界 / 裁剪到上级 | 属性面板或右键菜单 |
 | 属性 | 名称、级别（常用级别一键选择）、备注、颜色；其他属性可改值、删除、新增 |
 | 统计 | 面积、周长、长度、顶点数、中心坐标、下级覆盖比例（按球面计算） |
-| 文件 | 新建、打开、导入到所选节点下、保存、另存为、导出所选（含下级）；把 .geojson 拖进窗口即可打开或导入。大文件在后台读取，界面不卡 |
+| 文件 | 新建、打开、导入到所选节点下、保存、另存为、导出并保留层级信息、导出所选（含下级）；把 .geojson 拖进窗口即可打开或导入。大文件在后台读取，界面不卡 |
+| 检查更新 | 启动时自动检查 GitHub 上的新版本（没有新版本时一天最多查一次），右上角出现“新版本”提示。可以查看更新内容、下载（显示进度、核对 SHA-256）并在重启后完成替换，也可以等退出程序时再安装。文件菜单里可以手动检查 |
 | 撤销 / 重做 | ⌘/Ctrl+Z、⌘/Ctrl+Shift+Z |
 
 完整快捷键见右上角的键盘按钮。
@@ -52,7 +56,9 @@ xattr -dr com.apple.quarantine "GeoJSON 层级编辑器.app"
 - **分级简化显示**：每条边界预先算好每个顶点的 Douglas–Peucker 显著度，按当前缩放级别只取需要的顶点，屏幕上的误差不超过 0.25 像素。缩小到全国范围时，161 万个顶点只需画几千个。
 - **图层缓存**：数据量大时，面和线先画到一张比视野大一圈的离屏图像上，平移时直接挪动图像；滚轮缩放过程中先把图像按比例缩放顶替，停下后再重画清晰的版本。
 - **后台读取**：2 MB 以上的文件在后台线程读取，同时并行完成投影和简化准备，读取时显示进度遮罩。
-- **其他**：命中测试、吸附、切割预览都只查视野内的要素，大边界按分块包围盒只检查鼠标附近的顶点；切割预览在后台线程计算；标注按网格做碰撞检测，每帧计算新标注的时间有上限；点标记很多时改画小圆点；撤销快照复用没有变化的要素，历史步数随文档大小自动收缩。
+- **点聚合**：参照 Mapbox supercluster 的做法，从最细的缩放级别往上逐级贪心聚合，每一级的簇都由下一级合并而来，放大时簇只会拆开、不会跳动。与 supercluster 取重心不同，这里按重要度排序后做种子，簇就放在最重要那个点的真实位置上。5,000 个点建索引约 20 ms，两万个点以上在后台线程构建。
+- **自动识别层级**：用 R 树筛候选，在要素内部均匀取点、用带索引的点面定位器判断落在哪些面里，全部要素并行计算。北宋崇宁元年的数据（24 路、330 州、1,287 县、1,287 个治所，约 370 万个顶点）识别约 1 秒。
+- **其他**：命中测试、吸附、切割预览都只查视野内的要素，大边界按分块包围盒只检查鼠标附近的顶点；切割预览在后台线程计算；标注按网格做碰撞检测，每帧计算新标注的时间有上限；撤销快照复用没有变化的要素，历史步数随文档大小自动收缩。
 
 在一台 Apple Silicon 的 Mac 上，用离屏 CPU 画布（2880×1800 像素）绘制一帧面图层的耗时。测试数据是 2,184 个面、161 万个顶点，程序里实际走 GPU，会更快：
 
@@ -67,7 +73,15 @@ xattr -dr com.apple.quarantine "GeoJSON 层级编辑器.app"
 
 ## 文件格式
 
-保存为标准 GeoJSON `FeatureCollection`，每个要素一行，上级在前。层级写在 `properties` 里：
+保存为标准 GeoJSON `FeatureCollection`，每个要素一行，上级在前。
+
+保存时是否写入层级字段取决于文件本来的样子：
+
+- 新建的文档、本来就带 `parentId` 的文件：层级写在 `properties` 里（见下）。
+- 原来没有层级字段的文件（例如自动识别出层级的）：识别或调整出的上下级关系只保存在程序里。第一次保存时会问是“写入层级信息”还是“只保存原有字段”。只保存原有字段时文件结构保持原样：改过的名称写回它原来所在的字段（例如 `name_zh`），不添加 `id`、`parentId`、`name` 这些字段。
+- “文件 → 导出并保留层级信息”总是另存一份带层级字段的文件，不影响当前文档的保存位置。
+
+层级格式：
 
 ```json
 {"type":"Feature","id":"c1","properties":{"id":"c1","parentId":"p1","name":"云溪市","level":"市","color":"#3B82F6"},"geometry":{...}}
@@ -76,6 +90,7 @@ xattr -dr com.apple.quarantine "GeoJSON 层级编辑器.app"
 - `geometry` 为 `null` 的是分组。点标记另有 `icon`（`pin`、`circle`、`star`、`square`、`triangle`、`flag`），隐藏的要素写 `hidden: true`。
 - 其他属性原样保留、原样写回（数字的写法也不变）。
 - 读取时兼容阿里云 DataV 行政区数据：没有 `parentId` 时用 `adcode` 和 `parent.adcode` 还原层级，`level` 的 province/city/district 转成 省/市/区县。也认 geojson.io 的 `fill`、`stroke`、`marker-color` 颜色。
+- 没有 `name` 时依次用 `title`、`NAME`、`name_zh`、`名称` 等字段作名称，没有 `level` 时用 `admin_type`、`级别` 等字段作级别，没有 `id` 时用 `feature_id` 等字段作 id。这些字段原样保留。
 - 写出时外环逆时针、内环顺时针（RFC 7946），坐标保留 7 位小数。
 - 复制到剪贴板的内容也是 GeoJSON，只是在 `FeatureCollection` 上多一个 `geojsonEditor` 字段，记录坐标系和来源文档。
 
@@ -84,6 +99,12 @@ xattr -dr com.apple.quarantine "GeoJSON 层级编辑器.app"
 底图可选高德地图、高德影像、Esri 浅灰 / 深灰画布、Esri 影像、OpenStreetMap，或者不用底图；可以调淡化程度、切换灰度。高德是 GCJ-02 坐标，其余是 WGS-84。数据坐标系在属性面板的概况里设置，和底图不一致时显示时自动纠偏，文件里的坐标不会被改动。
 
 瓦片缓存在本机：macOS 在 `~/Library/Application Support/GeoJsonEditor/tiles`，Windows 在 `%LOCALAPPDATA%\GeoJsonEditor\tiles`，看过的区域离线也能显示。
+
+## 自动更新
+
+程序通过 GitHub 的 Releases 接口检查新版本，按系统下载对应的安装包（`GeoJsonEditor-<版本>-win-x64.zip` 或 `-macos-arm64.zip`），核对发布页记录的 SHA-256 后解压到本机的临时目录，退出程序时替换：Windows 上把旧文件改名为 `.old`、新文件放到原位；macOS 上整个 `.app` 换掉。旧文件下次启动时清理。替换失败时保持旧版本不动。
+
+以下情况不能自动安装，会提示到发布页手动下载：从源码运行；macOS 上直接在“下载”文件夹里打开、被系统放到只读隔离位置的程序（拖到“应用程序”文件夹后再打开就可以）；程序所在的文件夹没有写入权限（例如 Windows 的 Program Files）。
 
 ## 从源码构建
 
@@ -114,13 +135,14 @@ dotnet run --project tests/LogicTests
 ```
 src/
   Program.cs              按平台注册 MewUI 平台、渲染后端和 Skia 互操作
-  App/Editor.cs           编辑器状态与全部编辑操作（绘制、合并、切割、剪贴板、层级、属性、层级检查、简化）
-  Model/                  层级节点；文档（树、选择集、快照式撤销重做）
-  IO/GeoJsonIO.cs         带层级的 GeoJSON 读写（流式）
+  App/Editor.cs           编辑器状态与全部编辑操作（绘制、合并、切割、剪贴板、层级、属性、层级检查、简化、顶点编辑状态）
+  App/UpdateService.cs    从 GitHub Releases 检查、下载、替换新版本
+  Model/                  层级节点；文档（树、选择集、快照式撤销重做）；从级别文字推断行政层级
+  IO/GeoJsonIO.cs         带层级的 GeoJSON 读写（流式），两种写法：写入层级 / 保持原有字段
   IO/GeoClipboard.cs      剪贴板格式：GeoJSON / WKT / 经纬度文本的识别与坐标系转换
-  Geo/                    投影与纠偏、球面量算、合并切割裁剪、顶点编辑、保持拓扑的边界简化
-  Map/                    瓦片、视口、投影缓存与分级简化、Skia 地图画布（绘制、图层缓存、交互）
-  Ui/                     主窗口、图层树、属性面板、简化对话框、样式、图标、中文化
+  Geo/                    投影与纠偏、球面量算、合并切割裁剪、顶点编辑、保持拓扑的边界简化、自动识别层级
+  Map/                    瓦片、视口、投影缓存与分级简化、点聚合、Skia 地图画布（绘制、标注、图层缓存、交互）
+  Ui/                     主窗口、图层树、属性面板、简化 / 识别层级 / 检查更新对话框、样式、图标、中文化
 tests/LogicTests/         核心逻辑测试、大数据生成与绘制耗时测试
 scripts/                  打包脚本、MewUI 补丁包生成脚本
 vendor/                   打过补丁的 MewUI Win32 平台包

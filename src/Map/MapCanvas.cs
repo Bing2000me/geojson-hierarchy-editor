@@ -54,6 +54,8 @@ public sealed partial class MapCanvas : SkiaCanvasView
         _editor.BaseMapFade.Changed += InvalidateVisual;
         _editor.BaseMapGray.Changed += InvalidateVisual;
         _editor.ShowLabels.Changed += InvalidateVisual;
+        _editor.ClusterPoints.Changed += InvalidateVisual;
+        _editor.VertexEditTarget.Changed += OnVertexEditChanged;
         _editor.Highlights.Changed += InvalidateVisual;
         _editor.ZoomToRequested += nodes => ZoomTo(nodes);
         OnBaseMapChanged();
@@ -120,6 +122,15 @@ public sealed partial class MapCanvas : SkiaCanvasView
     private void OnSelectionChanged()
     {
         _vertexHover = null;
+        InvalidateVisual();
+    }
+
+    private void OnVertexEditChanged()
+    {
+        _vertexHover = null;
+        _handleKey = default;
+        UpdateHint();
+        UpdateCursor();
         InvalidateVisual();
     }
 
@@ -279,28 +290,21 @@ public sealed partial class MapCanvas : SkiaCanvasView
         var lines = new List<(GeoNode Node, double D)>();
         var polys = new List<GeoNode>();
         double tolLine = 6 / s;
-        double tolPoint = 36 / s;
 
-        // 用当前缩放级别的简化路径判断：误差不到四分之一像素，顶点却少得多
+        // 点只认上一帧画出来的标记：聚合时收进簇里的点看不见，也不该被点中
+        foreach (var (n, d) in HitShownMarkers(sx, sy))
+        {
+            if (!IsLive(n)) continue;
+            int k = points.FindIndex(x => ReferenceEquals(x.Node, n));
+            if (k < 0) points.Add((n, d));
+            else if (d < points[k].D) points[k] = (n, d);
+        }
+
+        // 线和面用当前缩放级别的简化路径判断：误差不到四分之一像素，顶点却少得多
         foreach (var (n, shape) in Candidates())
         {
             switch (shape.Kind)
             {
-                case NodeKind.Point:
-                {
-                    if (!shape.Intersects(wx - tolPoint, wy - tolPoint, wx + tolPoint, wy + tolPoint)) break;
-                    for (int i = 0; i < shape.Points.Length; i += 2)
-                    {
-                        var (px, py) = _vp.WorldToScreen(shape.Points[i], shape.Points[i + 1]);
-                        var rect = MarkerHitRect(n.Icon, px, py);
-                        if (rect.Contains((float)sx, (float)sy))
-                        {
-                            points.Add((n, (px - sx) * (px - sx) + (py - sy) * (py - sy)));
-                            break;
-                        }
-                    }
-                    break;
-                }
                 case NodeKind.Line:
                 {
                     if (!shape.Intersects(wx - tolLine, wy - tolLine, wx + tolLine, wy + tolLine)) break;

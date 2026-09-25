@@ -9,7 +9,7 @@
     <RootNamespace>GeoJsonEditor</RootNamespace>
     <AssemblyName>GeoJsonEditor</AssemblyName>
     <Product>GeoJSON 层级编辑器</Product>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Copyright>Copyright © 2026</Copyright>
     <ApplicationIcon Condition="$(RuntimeIdentifier.StartsWith('win'))">assets\app.ico</ApplicationIcon>
   </PropertyGroup>
@@ -24,6 +24,11 @@
     -->
     <PackageReference Include="Aprillz.MewUI.Platform.Win32" Version="0.21.1.1" />
     <PackageReference Include="NetTopologySuite" Version="2.6.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 测试项目要直接组装层级树（GeoNode 的内部成员） -->
+    <InternalsVisibleTo Include="LogicTests" />
   </ItemGroup>
 
   <ItemGroup>

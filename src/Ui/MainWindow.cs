@@ -96,6 +96,19 @@ public sealed partial class MainWindow : Window
         Closed += SaveSettings;
 
         LoadInitialDocument(args, openSample);
+
+        // 第一个窗口打开后稍等一会儿再去 GitHub 查新版本，不拖慢启动
+        if (openSample)
+        {
+            Loaded += async () =>
+            {
+                await Task.Delay(3000);
+                if (await UpdateDialog.AutoCheckAsync(_settings) is { } found)
+                {
+                    this.ShowToast($"发现新版本 {found.Version}，点右上角的“新版本”查看更新内容。");
+                }
+            };
+        }
     }
 
     // ───────────────────────── 设置 ─────────────────────────
@@ -107,6 +120,7 @@ public sealed partial class MainWindow : Window
         _editor.BaseMapGray.Value = _settings.BaseMapGray;
         _editor.DataCrs.Value = _settings.DataCrs == "gcj02" ? CoordSystem.Gcj02 : CoordSystem.Wgs84;
         _editor.ShowLabels.Value = _settings.ShowLabels;
+        _editor.ClusterPoints.Value = _settings.ClusterPoints;
     }
 
     private void SaveSettings()
@@ -116,6 +130,7 @@ public sealed partial class MainWindow : Window
         _settings.BaseMapGray = _editor.BaseMapGray.Value;
         _settings.DataCrs = _editor.DataCrs.Value == CoordSystem.Gcj02 ? "gcj02" : "wgs84";
         _settings.ShowLabels = _editor.ShowLabels.Value;
+        _settings.ClusterPoints = _editor.ClusterPoints.Value;
         _settings.Save();
     }
 
@@ -235,12 +250,21 @@ public sealed partial class MainWindow : Window
             case Key.Add: _map.ZoomBy(1); break;
             case Key.Subtract: _map.ZoomBy(-1); break;
             case Key.F2: _inspector.FocusName(); break;
+            case Key.Enter when e.Modifiers == ModifierKeys.None:
+                // 回车：进入 / 完成顶点编辑
+                if (_editor.VertexEditTarget.Value != null) _editor.EndVertexEdit();
+                else if (_editor.Tool.Value == EditTool.Select && _editor.VertexEditCandidate != null) _editor.BeginVertexEdit();
+                else return;
+                break;
             case Key.Delete or Key.Backspace:
+                // 编辑顶点时 Delete 只删鼠标下的顶点（由地图处理），不删整个要素
+                if (_editor.VertexEditTarget.Value != null) break;
                 if (_editor.Doc.Selection.Count > 0) _editor.DeleteSelection();
                 else return;
                 break;
             case Key.Escape:
                 if (_editor.Tool.Value != EditTool.Select) SetTool(EditTool.Select);
+                else if (_editor.VertexEditTarget.Value != null) _editor.EndVertexEdit();
                 else _editor.Doc.ClearSelection();
                 break;
             default:
@@ -361,7 +385,7 @@ public sealed partial class MainWindow : Window
         });
         return answer switch
         {
-            true => SaveDocument(saveAs: false),
+            true => await SaveDocumentAsync(saveAs: false),
             null => true,
             false => false,
         };
@@ -415,18 +439,51 @@ public sealed partial class MainWindow : Window
         try
         {
             var (result, shapes) = await ReadInBackground(path, $"正在打开 {Path.GetFileName(path)}…");
+
+            // 没有层级字段的文件：询问是否自动识别上下级关系（识别结果只进程序内部的层级树）
+            IReadOnlyList<GeoNode>? roots = null;
+            int detected = 0;
+            if (ShouldAskHierarchy(result))
+            {
+                var nodes = result.Roots.SelectMany(r => r.SelfAndDescendants()).ToList();
+                var outcome = await HierarchyDialog.ShowAsync(this, _settings, HierarchyDialog.Purpose.Open, Path.GetFileName(path), nodes, nodes, result.LinkedCount);
+                if (outcome.Cancelled) return;
+                if (outcome.Detection is { } detection)
+                {
+                    roots = detection.Rebuild(nodes);
+                    detected = nodes.Count(n => n.Parent != null);
+                }
+            }
+
             if (shapes != null) _map.AdoptShapes(shapes);
-            _editor.Load(result, path);
+            _editor.Load(result, path, roots);
             _settings.AddRecent(path);
             _map.ZoomToAll();
             string msg = $"已打开 {Path.GetFileName(path)}：{result.FeatureCount:N0} 个要素";
-            if (result.LinkedCount > 0) msg += $"，识别出 {result.LinkedCount:N0} 个上下级关系";
+            if (detected > 0) msg += $"，建立了 {detected:N0} 个上下级关系（只保存在程序里，保存时再决定是否写入文件）";
+            else if (result.LinkedCount > 0) msg += $"，识别出 {result.LinkedCount:N0} 个上下级关系";
             this.ShowToast(msg + "。" + string.Join("", result.Warnings));
         }
         catch (Exception ex)
         {
             _ = MessageBox.NotifyAsync("无法打开文件", PromptIconKind.Error, ex.Message, this);
         }
+    }
+
+    /// <summary>打开或导入的文件没有本程序的层级字段、又有面可以做上级时，询问是否自动识别层级。</summary>
+    private bool ShouldAskHierarchy(ReadResult result)
+    {
+        if (!_settings.AskHierarchyOnOpen || result.HasHierarchyFields || result.FeatureCount < 2) return false;
+        return result.Roots.SelectMany(r => r.SelfAndDescendants()).Any(n => n.Kind == NodeKind.Polygon);
+    }
+
+    /// <summary>编辑菜单“识别层级结构…”：对当前文档重新识别，预览后作为一步撤销应用。</summary>
+    private async void DetectHierarchy()
+    {
+        if (_busy || _editor.Doc.Count < 2) return;
+        var nodes = _editor.Doc.AllNodes().ToList();
+        var outcome = await HierarchyDialog.ShowAsync(this, _settings, HierarchyDialog.Purpose.Document, _editor.Doc.DisplayName, nodes, nodes, 0);
+        if (!outcome.Cancelled && outcome.Detection is { } detection) _editor.ApplyHierarchy(detection);
     }
 
     /// <summary>读取文件（并在后台准备投影）。文件小时在 UI 线程上直接读，免得遮罩一闪而过。</summary>
@@ -473,10 +530,29 @@ public sealed partial class MainWindow : Window
         {
             var parent = Editor.SuggestDrawTarget(_editor.Doc.Primary);
             var (result, shapes) = await ReadInBackground(path, $"正在导入 {Path.GetFileName(path)}…");
+
+            // 导入的要素可以挂到文档里已有的要素下（例如先打开了路，再导入州）
+            IReadOnlyList<GeoNode> roots = result.Roots;
+            int detected = 0;
+            if (ShouldAskHierarchy(result) || (_settings.AskHierarchyOnOpen && !result.HasHierarchyFields && _editor.Doc.AllNodes().Any(n => n.Kind == NodeKind.Polygon)))
+            {
+                var nodes = result.Roots.SelectMany(r => r.SelfAndDescendants()).ToList();
+                var pool = _editor.Doc.AllNodes().Concat(nodes).ToList();
+                var outcome = await HierarchyDialog.ShowAsync(this, _settings, HierarchyDialog.Purpose.Import, Path.GetFileName(path), nodes, pool, result.LinkedCount);
+                if (outcome.Cancelled) return;
+                if (outcome.Detection is { } detection)
+                {
+                    roots = detection.Rebuild(nodes);
+                    detected = nodes.Count(n => n.Parent != null);
+                }
+            }
+
             if (shapes != null) _map.AdoptShapes(shapes);
-            _editor.AddImported(result.Roots, parent);
-            _map.ZoomTo(result.Roots);
-            this.ShowToast($"已导入 {result.FeatureCount:N0} 个要素到「{parent?.DisplayName ?? "根级"}」。");
+            _editor.AddImported(roots, parent);
+            _map.ZoomTo(roots);
+            this.ShowToast(detected > 0
+                ? $"已导入 {result.FeatureCount:N0} 个要素，按识别结果挂到了各自的上级下。"
+                : $"已导入 {result.FeatureCount:N0} 个要素到「{parent?.DisplayName ?? "根级"}」。");
         }
         catch (Exception ex)
         {
@@ -484,9 +560,43 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private bool SaveDocument(bool saveAs)
+    private async Task<bool> SaveDocumentAsync(bool saveAs)
     {
-        var path = _editor.Doc.FilePath;
+        var doc = _editor.Doc;
+        bool? hierarchy = null;
+        if (!doc.WritesHierarchy && !doc.PlainSaveConfirmed && doc.AllNodes().Any(n => n.Parent != null))
+        {
+            // 文件原来没有层级字段：层级只在程序里，问一次是否写入文件
+            // Accept → true（写入），Destructive → null（只保存原有字段），Reject → false（取消）
+            var answer = await MessageBox.PromptAsync(new MessageBoxOptions
+            {
+                Owner = this,
+                Message = "要把层级信息写入文件吗？",
+                Detail = $"「{doc.DisplayName}」原来的属性里没有层级字段，现在的上下级关系只保存在程序里。\n\n"
+                         + "写入层级信息：给每个要素的属性加上 id 和 parentId，下次打开能直接还原层级。\n"
+                         + "只保存原有字段：文件结构保持原样，上下级关系不写入文件。\n\n"
+                         + "也可以用“文件 → 导出并保留层级信息”另存一份带层级的文件。",
+                Icon = PromptIconKind.Question,
+                Buttons =
+                [
+                    new MessageButton("写入层级信息", MessageButtonRole.Accept),
+                    new MessageButton("只保存原有字段", MessageButtonRole.Destructive),
+                    new MessageButton("取消", MessageButtonRole.Reject),
+                ],
+            });
+            if (answer == false) return false;
+            if (answer == true)
+            {
+                doc.WritesHierarchy = true;
+            }
+            else
+            {
+                doc.PlainSaveConfirmed = true;
+                hierarchy = false;
+            }
+        }
+
+        var path = doc.FilePath;
         bool isSample = path != null && path.StartsWith(AppContext.BaseDirectory, StringComparison.Ordinal);
         if (saveAs || path == null || isSample)
         {
@@ -503,15 +613,40 @@ public sealed partial class MainWindow : Window
         }
         try
         {
-            _editor.Save(path);
+            _editor.Save(path, hierarchy);
             _settings.AddRecent(path);
-            this.ShowToast("已保存到 " + Path.GetFileName(path));
+            this.ShowToast("已保存到 " + Path.GetFileName(path) + (doc.WritesHierarchy ? "" : "（保持原有字段）"));
             return true;
         }
         catch (Exception ex)
         {
             _ = MessageBox.NotifyAsync("保存失败", PromptIconKind.Error, ex.Message, this);
             return false;
+        }
+    }
+
+    /// <summary>导出整个文档并把层级写进每个要素的属性（id、parentId），不改变当前文档的保存位置。</summary>
+    private void ExportWithHierarchy()
+    {
+        if (_editor.Doc.Count == 0) return;
+        var path = FileDialog.SaveFile(new SaveFileDialogOptions
+        {
+            Owner = this,
+            Title = "导出并保留层级信息",
+            Filters = GeoJsonFilters,
+            FileName = _editor.Doc.DisplayName + "-层级.geojson",
+            DefaultExtension = "geojson",
+            InitialDirectory = InitialDirectory(),
+        });
+        if (path == null) return;
+        try
+        {
+            _editor.ExportWithHierarchy(path);
+            this.ShowToast("已导出到 " + Path.GetFileName(path) + "，每个要素带 id 和 parentId。");
+        }
+        catch (Exception ex)
+        {
+            _ = MessageBox.NotifyAsync("导出失败", PromptIconKind.Error, ex.Message, this);
         }
     }
 
@@ -545,6 +680,15 @@ public sealed partial class MainWindow : Window
         var p = _editor.Doc.FilePath ?? _settings.RecentFiles.FirstOrDefault();
         if (p != null && !p.StartsWith(AppContext.BaseDirectory, StringComparison.Ordinal)) return Path.GetDirectoryName(p);
         return Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+    }
+
+    /// <summary>关闭前处理未保存的修改（重启安装更新时用）；用户取消时返回 false。</summary>
+    internal async Task<bool> ConfirmCloseAsync()
+    {
+        if (_busy) return false;
+        if (!await ConfirmDiscardAsync()) return false;
+        _closeConfirmed = true;
+        return true;
     }
 
     private async void OnClosing(ClosingEventArgs e)
