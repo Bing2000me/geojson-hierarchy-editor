@@ -71,6 +71,7 @@ export DOTNET_ROOT=$HOME/.dotnet PATH=$HOME/.dotnet:$PATH
 ## 注意事项
 
 - `Program.cs` 里每个平台的注册放在单独的 `NoInlining` 方法里。按 RID 发布时只带当前平台的程序集，写在同一个方法里会在启动时找不到其他平台的程序集而崩溃。
+- 根目录的 `Directory.Build.targets` 让应用和测试项目编译、发布时都不复制 NuGet 原生包里的 `.pdb`（`SkiaSharp.NativeAssets.Win32` 的三个 Windows 版 `libSkiaSharp.pdb`，每个 80 多 MB，发布的 Windows 包本来就不带）。不指定平台的编译输出因此从 422M 降到 178M 左右。
 - `GeoDocument` 的所有修改都要放在 `Edit(...)` 里，撤销是整份快照（几何对象按不可变值共享引用；没变的节点复用上一次的状态对象），恢复时按 id 就地更新节点对象。历史步数按文档大小自动收缩。
 - MewUI 的 `ToggleButton` 没有 `Click` 事件，工具按钮和标签按钮用 `Ui/ClickToggle`。
 - 复制 / 剪切 / 粘贴 / 全选走 MewUI 的 `StandardCommands`，在窗口级注册处理器：输入框有焦点时由输入框自己处理（复制文字），焦点在地图、图层树时复制要素。不要把 ⌘C 等直接映射到窗口的 `InputMap`，会抢在应用级映射之前，把输入框的复制截走。也不要把单个字母键映射进 `InputMap`：输入框不在 KeyDown 里吃字母键，会漏到窗口的映射上。

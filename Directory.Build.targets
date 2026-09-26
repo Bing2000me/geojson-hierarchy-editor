@@ -1,0 +1,17 @@
+<Project>
+
+  <!--
+    编译和发布时不复制 NuGet 原生包里的 .pdb 调试符号。
+    SkiaSharp.NativeAssets.Win32 给 win-x64、win-arm64、win-x86 各带一个 80 多 MB 的 libSkiaSharp.pdb，
+    只在调试 Skia 自身的 C++ 代码时用得到：不指定平台的编译（应用和测试项目）会把三个都复制过去，
+    打 Windows 包时也会在 exe 旁边多出一个（单文件 exe 不含它，发布的 zip 里本来就没有）。
+    写在这里而不是 csproj 里，是为了让测试项目也生效。
+  -->
+  <Target Name="RemoveNativePdbs" AfterTargets="ResolvePackageAssets">
+    <ItemGroup>
+      <RuntimeTargetsCopyLocalItems Remove="@(RuntimeTargetsCopyLocalItems)" Condition="'%(RuntimeTargetsCopyLocalItems.Extension)' == '.pdb'" />
+      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)" Condition="'%(NativeCopyLocalItems.Extension)' == '.pdb'" />
+    </ItemGroup>
+  </Target>
+
+</Project>
